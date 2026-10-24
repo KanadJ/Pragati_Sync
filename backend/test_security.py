@@ -43,6 +43,7 @@ class RoleBasedAccessTests(unittest.TestCase):
         endpoints = [
             "/api/applications",
             "/api/workflows",
+            "/api/evc",
             "/api/dashboard",
             "/api/applications/AICTE-2026-1001/history",
             "/api/audit",
@@ -57,6 +58,7 @@ class RoleBasedAccessTests(unittest.TestCase):
         endpoints = [
             "/api/applications",
             "/api/workflows",
+            "/api/evc",
             "/api/dashboard",
             "/api/applications/AICTE-2026-1001/history",
             "/api/audit",
@@ -117,6 +119,16 @@ class RoleBasedAccessTests(unittest.TestCase):
                 "patch",
                 "/api/applications/AICTE-2026-1001/compliance",
                 {"due_date": "2026-11-01"},
+            ),
+            (
+                "post",
+                "/api/applications/AICTE-2026-1001/evc/schedule",
+                {"scheduled_date": "2026-12-01"},
+            ),
+            (
+                "post",
+                "/api/applications/AICTE-2026-1001/evc/complete",
+                {},
             ),
         ]
 

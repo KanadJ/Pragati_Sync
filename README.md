@@ -71,6 +71,33 @@ Routing metadata is stored inside the existing application JSON record and
 workflow events use the existing audit table. No database schema changes or
 migrations are required for this feature.
 
+## EVC scheduling and tracking
+
+The EVC Tracking page lists only applications whose configured route includes
+an `EVC` stage. Applications without an assigned EVC route are not shown.
+Eligible applications without a tracking record display as `Pending
+Scheduling`; schedule/reschedule, delayed, and completed state is persisted in
+the additive SQLite `evc_tracking` table.
+
+Authenticated roles may read `GET /api/evc`. Admin and Officer may schedule or
+reschedule an EVC using
+`POST /api/applications/{application_id}/evc/schedule` with a valid
+`scheduled_date` (`YYYY-MM-DD`) and optional notes. The same endpoint
+reschedules an existing, incomplete visit. They may mark a scheduled visit
+completed through `POST /api/applications/{application_id}/evc/complete`,
+including optional completion notes. Viewers cannot modify EVC records.
+Scheduling, rescheduling, and completion are recorded in the existing
+application audit trail with the acting username and timestamp.
+
+The upcoming display window is configured by
+`evc_tracking.upcoming_window_days` in `backend/compliance_settings.json` (30
+days in the demo configuration). A scheduled visit with a past date is
+reported as `Delayed` when the tracking list is fetched; this is derived from
+the date and does not run a reminder or escalation job. The application may
+reschedule delayed cases. The configured window is a demo usability setting,
+not an official AICTE processing deadline. No background reminders,
+escalations, or automated EVC scheduling are implemented.
+
 ## Explainable workflow risk assessment
 
 `GET /api/monitoring` includes a deterministic, rule-based `risk_score`

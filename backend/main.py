@@ -290,6 +290,24 @@ def initialize_database():
             )
         """)
         connection.execute("""
+            CREATE TABLE IF NOT EXISTS evc_tracking (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                application_id TEXT NOT NULL UNIQUE,
+                scheduled_date TEXT,
+                notes TEXT,
+                status TEXT NOT NULL DEFAULT 'Pending Scheduling'
+                    CHECK (status IN ('Pending Scheduling', 'Scheduled', 'Completed')),
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                completed_at TEXT,
+                FOREIGN KEY (application_id) REFERENCES applications(id)
+            )
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_evc_tracking_scheduled
+            ON evc_tracking(scheduled_date)
+        """)
+        connection.execute("""
             CREATE INDEX IF NOT EXISTS idx_notifications_created
             ON notifications(created_at DESC)
         """)
@@ -407,6 +425,16 @@ def get_compliance_settings():
         or escalation_days != sorted(set(escalation_days))
     ):
         raise HTTPException(status_code=500, detail="Invalid compliance settings configuration")
+    evc_settings = settings.get("evc_tracking", {"upcoming_window_days": 30})
+    if (
+        not isinstance(evc_settings, dict)
+        or set(evc_settings) != {"upcoming_window_days"}
+        or not isinstance(evc_settings["upcoming_window_days"], int)
+        or isinstance(evc_settings["upcoming_window_days"], bool)
+        or evc_settings["upcoming_window_days"] < 0
+    ):
+        raise HTTPException(status_code=500, detail="Invalid EVC tracking configuration")
+    settings["evc_tracking"] = evc_settings
     settings["workflow_risk_assessment"] = validate_workflow_risk_assessment(
         settings.get(
             "workflow_risk_assessment",
@@ -414,6 +442,71 @@ def get_compliance_settings():
         )
     )
     return settings
+
+
+def application_requires_evc(application):
+    route = WORKFLOW_ROUTES.get(application.get("workflow_route"))
+    return route is not None and "EVC" in route
+
+
+def get_evc_status(record, today=None):
+    today = today or date.today()
+    if record["status"] == "Completed":
+        return "Completed"
+    scheduled_date = parse_date(record.get("scheduled_date"))
+    if scheduled_date is None:
+        return "Pending Scheduling"
+    if scheduled_date < today:
+        return "Delayed"
+    return "Scheduled"
+
+
+def list_evc_tracking(today=None):
+    today = today or date.today()
+    applications = get_all_applications()
+    eligible = [app for app in applications if application_requires_evc(app)]
+    if not eligible:
+        return []
+
+    with connect_db() as connection:
+        records = {
+            row["application_id"]: dict(row)
+            for row in connection.execute("SELECT * FROM evc_tracking").fetchall()
+        }
+
+    items = []
+    for application in eligible:
+        record = records.get(application["id"])
+        if record is None:
+            items.append({
+                "application_id": application["id"],
+                "institution": application.get("institution"),
+                "stage": application.get("stage"),
+                "application_status": application.get("status"),
+                "scheduled_date": None,
+                "notes": None,
+                "status": "Pending Scheduling",
+                "created_at": None,
+                "updated_at": None,
+                "completed_at": None,
+            })
+        else:
+            items.append({
+                **record,
+                "institution": application.get("institution"),
+                "stage": application.get("stage"),
+                "application_status": application.get("status"),
+                "status": get_evc_status(record, today),
+            })
+    return sorted(
+        items,
+        key=lambda item: (
+            item["status"] != "Delayed",
+            item["scheduled_date"] is None,
+            item["scheduled_date"] or "",
+            item["application_id"],
+        ),
+    )
 
 
 def validate_workflow_risk_assessment(value):
@@ -1425,6 +1518,154 @@ def create_application(
 @app.get("/api/workflows")
 def get_workflows(user=Depends(get_current_user)):
     return {"workflows": WORKFLOW_ROUTES}
+
+
+@app.get("/api/evc")
+def get_evc_tracking(user=Depends(get_current_user)):
+    settings = get_compliance_settings()
+    evcs = list_evc_tracking()
+    today = date.today()
+    upcoming_cutoff = today + timedelta(
+        days=settings["evc_tracking"]["upcoming_window_days"]
+    )
+    return {
+        "checked_on": today.isoformat(),
+        "upcoming_window_days": settings["evc_tracking"]["upcoming_window_days"],
+        "evcs": evcs,
+        "upcoming_count": sum(
+            1 for item in evcs
+            if item["status"] == "Scheduled"
+            and (scheduled_date := parse_date(item["scheduled_date"])) is not None
+            and scheduled_date <= upcoming_cutoff
+        ),
+        "overdue_count": sum(1 for item in evcs if item["status"] == "Delayed"),
+    }
+
+
+@app.post("/api/applications/{application_id}/evc/schedule")
+def schedule_evc(
+    application_id: str,
+    payload: dict = Body(...),
+    user=Depends(require_roles("Admin", "Officer")),
+):
+    application = find_application(application_id)
+    if not application_requires_evc(application):
+        raise HTTPException(
+            status_code=409,
+            detail="The application's configured workflow route does not require an EVC",
+        )
+    if set(payload) - {"scheduled_date", "notes"} or "scheduled_date" not in payload:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide scheduled_date and optional notes",
+        )
+    scheduled_value = payload["scheduled_date"]
+    scheduled_date = parse_date(scheduled_value)
+    if (
+        not isinstance(scheduled_value, str)
+        or scheduled_date is None
+        or scheduled_date.isoformat() != scheduled_value
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="scheduled_date must be a valid YYYY-MM-DD date",
+        )
+    notes = payload.get("notes")
+    if notes is not None and not isinstance(notes, str):
+        raise HTTPException(status_code=400, detail="notes must be a string or null")
+    notes = notes.strip() if notes else None
+
+    with connect_db() as connection:
+        existing = connection.execute(
+            "SELECT * FROM evc_tracking WHERE application_id = ?",
+            (application_id,),
+        ).fetchone()
+        if existing and existing["status"] == "Completed":
+            raise HTTPException(status_code=409, detail="A completed EVC cannot be rescheduled")
+        is_reschedule = existing is not None
+        timestamp = now_iso()
+        connection.execute("""
+            INSERT INTO evc_tracking
+                (application_id, scheduled_date, notes, status, created_at, updated_at, completed_at)
+            VALUES (?, ?, ?, 'Scheduled', ?, ?, NULL)
+            ON CONFLICT(application_id) DO UPDATE SET
+                scheduled_date = excluded.scheduled_date,
+                notes = excluded.notes,
+                status = 'Scheduled',
+                updated_at = excluded.updated_at,
+                completed_at = NULL
+        """, (application_id, scheduled_value, notes, timestamp, timestamp))
+
+    record_event(
+        application,
+        "EVC rescheduled" if is_reschedule else "EVC scheduled",
+        application.get("stage"),
+        f"EVC scheduled for {scheduled_value}."
+        + (f" Notes: {notes}" if notes else ""),
+        user["username"],
+    )
+    with connect_db() as connection:
+        record = dict(connection.execute(
+            "SELECT * FROM evc_tracking WHERE application_id = ?",
+            (application_id,),
+        ).fetchone())
+    record["status"] = get_evc_status(record)
+    return {"evc": record}
+
+
+@app.post("/api/applications/{application_id}/evc/complete")
+def complete_evc(
+    application_id: str,
+    payload: dict = Body(default={}),
+    user=Depends(require_roles("Admin", "Officer")),
+):
+    application = find_application(application_id)
+    if not application_requires_evc(application):
+        raise HTTPException(
+            status_code=409,
+            detail="The application's configured workflow route does not require an EVC",
+        )
+    if set(payload) - {"notes"}:
+        raise HTTPException(status_code=400, detail="Only optional notes may be provided")
+    notes = payload.get("notes")
+    if notes is not None and not isinstance(notes, str):
+        raise HTTPException(status_code=400, detail="notes must be a string or null")
+    notes = notes.strip() if notes else None
+
+    with connect_db() as connection:
+        existing = connection.execute(
+            "SELECT * FROM evc_tracking WHERE application_id = ?",
+            (application_id,),
+        ).fetchone()
+        if existing is None or not existing["scheduled_date"]:
+            raise HTTPException(status_code=409, detail="Schedule the EVC before completing it")
+        if existing["status"] == "Completed":
+            raise HTTPException(status_code=409, detail="EVC is already completed")
+        completed_at = now_iso()
+        if notes:
+            existing_notes = existing["notes"] or ""
+            combined_notes = f"{existing_notes}\nCompletion: {notes}".strip()
+        else:
+            combined_notes = existing["notes"]
+        connection.execute("""
+            UPDATE evc_tracking
+            SET status = 'Completed', notes = ?, completed_at = ?, updated_at = ?
+            WHERE application_id = ?
+        """, (combined_notes, completed_at, completed_at, application_id))
+
+    record_event(
+        application,
+        "EVC completed",
+        application.get("stage"),
+        "EVC completed." + (f" Notes: {notes}" if notes else ""),
+        user["username"],
+    )
+    with connect_db() as connection:
+        record = dict(connection.execute(
+            "SELECT * FROM evc_tracking WHERE application_id = ?",
+            (application_id,),
+        ).fetchone())
+    return {"evc": record}
 
 
 @app.get("/api/dashboard")

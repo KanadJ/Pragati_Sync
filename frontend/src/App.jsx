@@ -28,6 +28,8 @@ function App() {
   const [auditEvents, setAuditEvents] = useState([])
   const [monitoring, setMonitoring] = useState(null)
   const [notifications, setNotifications] = useState([])
+  const [evcTracking, setEvcTracking] = useState({ evcs: [] })
+  const [evcDrafts, setEvcDrafts] = useState({})
   const [trackedDocuments, setTrackedDocuments] = useState([])
   const [expiryWarningDays, setExpiryWarningDays] = useState(30)
   const [renewalDrafts, setRenewalDrafts] = useState({})
@@ -103,13 +105,14 @@ function App() {
   }, [token])
 
   const refreshData = useCallback(async () => {
-    const [apps, workflowData, auditData, monitoringData, notificationData, trackingData, dashboardResult] =
+    const [apps, workflowData, auditData, monitoringData, notificationData, evcData, trackingData, dashboardResult] =
       await Promise.all([
         request('/api/applications'),
         request('/api/workflows'),
         request('/api/audit'),
         request('/api/monitoring'),
         request('/api/notifications'),
+        request('/api/evc'),
         request('/api/documents'),
         request('/api/dashboard')
           .then((data) => ({ data, error: '' }))
@@ -121,6 +124,7 @@ function App() {
     setAuditEvents(auditData.events || [])
     setMonitoring(monitoringData)
     setNotifications(notificationData.notifications || [])
+    setEvcTracking(evcData)
     setTrackedDocuments(trackingData.documents || [])
     setExpiryWarningDays(trackingData.expiry_warning_days)
     setDashboardData(dashboardResult.data)
@@ -236,6 +240,7 @@ function App() {
     setAuditEvents([])
     setMonitoring(null)
     setNotifications([])
+    setEvcTracking({ evcs: [] })
     setTrackedDocuments([])
     setDocuments([])
     setComplianceSummary(null)
@@ -524,6 +529,47 @@ function App() {
     }
   }
 
+  async function saveEvcSchedule(evc) {
+    if (!canProcess || busy) return
+    const draft = evcDrafts[evc.application_id] || {}
+    setBusy(true)
+    setNotice('')
+    try {
+      await request(`/api/applications/${encodeURIComponent(evc.application_id)}/evc/schedule`, {
+        method: 'POST',
+        body: JSON.stringify({
+          scheduled_date: draft.scheduled_date || '',
+          notes: draft.notes || null,
+        }),
+      })
+      await refreshData()
+      setNotice(evc.status === 'Pending Scheduling' ? 'EVC scheduled.' : 'EVC rescheduled.')
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function completeEvc(evc) {
+    if (!canProcess || busy) return
+    const draft = evcDrafts[evc.application_id] || {}
+    setBusy(true)
+    setNotice('')
+    try {
+      await request(`/api/applications/${encodeURIComponent(evc.application_id)}/evc/complete`, {
+        method: 'POST',
+        body: JSON.stringify({ notes: draft.completion_notes || null }),
+      })
+      await refreshData()
+      setNotice('EVC marked as completed.')
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function markNotificationRead(notificationId) {
     if (!canProcess) return
     try {
@@ -689,6 +735,7 @@ function App() {
         {[
           ['Dashboard', '▦'],
           ['Applications', '▤'],
+          ['EVC Tracking', '◎'],
           ['Document Tracking', '▧'],
           ['Monitoring', '◷'],
           ['Notifications', '♢'],
@@ -986,6 +1033,100 @@ function App() {
                 )}
               </div>
             </>
+          )}
+
+          {page === 'EVC Tracking' && (
+            <div className="panel">
+              <div className="section-heading">
+                <div>
+                  <h2>Expert Visit Committee tracking</h2>
+                  <p>Only applications with a configured route containing an EVC stage are listed. Upcoming window: {evcTracking.upcoming_window_days ?? 30} days (configurable demo setting).</p>
+                </div>
+                <div className="evc-counts">
+                  <span className="record-count">{evcTracking.upcoming_count || 0} upcoming</span>
+                  <span className="record-count">{evcTracking.overdue_count || 0} overdue</span>
+                </div>
+              </div>
+              {(evcTracking.evcs || []).length === 0 ? (
+                <div className="empty-state">No applications currently have a configured route requiring an EVC.</div>
+              ) : (evcTracking.evcs || []).map((evc) => {
+                const draft = evcDrafts[evc.application_id] || {}
+                return (
+                  <div className="audit-row evc-row" key={evc.application_id}>
+                    <div className={`evc-status-mark evc-${evc.status.toLowerCase().replaceAll(' ', '-')}`}>
+                      {evc.status === 'Completed' ? '✓' : evc.status === 'Delayed' ? '!' : '◎'}
+                    </div>
+                    <div className="evc-content">
+                      <strong>{evc.institution || evc.application_id}</strong>
+                      <p>{evc.application_id} · {evc.stage || 'Stage unavailable'} · application {evc.application_status || 'status unavailable'}</p>
+                      <p><strong>EVC status: {evc.status}</strong>{evc.scheduled_date ? ` · Scheduled ${evc.scheduled_date}` : ''}</p>
+                      {evc.notes && <p className="muted">{evc.notes}</p>}
+                      {canProcess && evc.status !== 'Completed' && (
+                        <div className="evc-actions">
+                          <label>Scheduled date
+                            <input
+                              type="date"
+                              value={draft.scheduled_date ?? evc.scheduled_date ?? ''}
+                              disabled={busy}
+                              onChange={(event) => setEvcDrafts((current) => ({
+                                ...current,
+                                [evc.application_id]: {
+                                  ...current[evc.application_id],
+                                  scheduled_date: event.target.value,
+                                },
+                              }))}
+                            />
+                          </label>
+                          <label>Scheduling / rescheduling notes
+                            <textarea
+                              rows={2}
+                              value={draft.notes ?? evc.notes ?? ''}
+                              disabled={busy}
+                              onChange={(event) => setEvcDrafts((current) => ({
+                                ...current,
+                                [evc.application_id]: {
+                                  ...current[evc.application_id],
+                                  notes: event.target.value,
+                                },
+                              }))}
+                            />
+                          </label>
+                          <button
+                            className="secondary-button"
+                            disabled={busy || !(draft.scheduled_date ?? evc.scheduled_date)}
+                            onClick={() => saveEvcSchedule(evc)}
+                          >
+                            {evc.status === 'Pending Scheduling' ? 'Schedule EVC' : 'Reschedule EVC'}
+                          </button>
+                          {evc.scheduled_date && (
+                            <>
+                              <label>Completion notes
+                                <textarea
+                                  rows={2}
+                                  value={draft.completion_notes || ''}
+                                  disabled={busy}
+                                  onChange={(event) => setEvcDrafts((current) => ({
+                                    ...current,
+                                    [evc.application_id]: {
+                                      ...current[evc.application_id],
+                                      completion_notes: event.target.value,
+                                    },
+                                  }))}
+                                />
+                              </label>
+                              <button className="primary-button" disabled={busy} onClick={() => completeEvc(evc)}>
+                                Mark completed
+                              </button>
+                            </>
+                          )}
+                        </div>
+                      )}
+                      {!canProcess && <span className="muted">Viewer access is read-only.</span>}
+                    </div>
+                  </div>
+                )
+              })}
+            </div>
           )}
 
           {page === 'Notifications' && (

@@ -378,6 +378,173 @@ class WorkflowAutomationTests(unittest.TestCase):
         self.assertTrue(result["risk_recommendations"])
         self.assertIn("High", response.json()["risk_summary"])
 
+    def test_evc_listing_only_includes_routes_that_require_evc(self):
+        self.add_application("TEST-EVC-ROUTE", workflow_route="SCRUTINY_EVC")
+        self.add_application("TEST-NO-EVC-ROUTE", workflow_route="SCRUTINY_ONLY")
+        response = self.client.get("/api/evc", headers=self.login("viewer"))
+        self.assertEqual(response.status_code, 200)
+        body = response.json()
+        self.assertEqual(body["upcoming_window_days"], 30)
+        self.assertEqual(
+            [item["application_id"] for item in body["evcs"]],
+            ["TEST-EVC-ROUTE"],
+        )
+        self.assertEqual(body["evcs"][0]["status"], "Pending Scheduling")
+
+    def test_evc_upcoming_window_is_configurable(self):
+        application_id = "TEST-EVC-WINDOW"
+        self.add_application(application_id, workflow_route="SCRUTINY_EVC")
+        headers = self.login("officer")
+        scheduled_date = (date.today() + timedelta(days=2)).isoformat()
+        self.assertEqual(
+            self.client.post(
+                f"/api/applications/{application_id}/evc/schedule",
+                headers=headers,
+                json={"scheduled_date": scheduled_date},
+            ).status_code,
+            200,
+        )
+
+        with patch(
+            "main.get_compliance_settings",
+            return_value={"evc_tracking": {"upcoming_window_days": 1}},
+        ):
+            body = self.client.get("/api/evc", headers=headers).json()
+        self.assertEqual(body["upcoming_window_days"], 1)
+        self.assertEqual(body["upcoming_count"], 0)
+
+    def test_evc_schema_migration_preserves_existing_application_records(self):
+        application = self.add_application(
+            "TEST-EVC-MIGRATION",
+            workflow_route="SCRUTINY_EVC",
+            custom_field="preserve this value",
+        )
+        main.initialize_database()
+        with main.connect_db() as connection:
+            stored = connection.execute(
+                "SELECT data FROM applications WHERE id = ?",
+                (application["id"],),
+            ).fetchone()
+            evc_table = connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'evc_tracking'"
+            ).fetchone()
+        self.assertEqual(json.loads(stored["data"])["custom_field"], "preserve this value")
+        self.assertIsNotNone(evc_table)
+
+    def test_evc_schedule_reschedule_delay_completion_persistence_and_audit(self):
+        application_id = "TEST-EVC-LIFECYCLE"
+        self.add_application(application_id, workflow_route="EVC_SAC_SHC")
+        officer = self.login("officer")
+        endpoint = f"/api/applications/{application_id}/evc"
+        self.assertEqual(
+            self.client.post(
+                f"{endpoint}/schedule",
+                headers=officer,
+                json={"scheduled_date": "invalid", "notes": "Initial planning"},
+            ).status_code,
+            400,
+        )
+
+        future_date = (date.today() + timedelta(days=2)).isoformat()
+        scheduled = self.client.post(
+            f"{endpoint}/schedule",
+            headers=officer,
+            json={"scheduled_date": future_date, "notes": "Initial visit plan"},
+        )
+        self.assertEqual(scheduled.status_code, 200)
+        self.assertEqual(scheduled.json()["evc"]["status"], "Scheduled")
+        self.assertEqual(scheduled.json()["evc"]["notes"], "Initial visit plan")
+
+        fetched = self.client.get("/api/evc", headers=officer).json()
+        listed = next(item for item in fetched["evcs"] if item["application_id"] == application_id)
+        self.assertEqual(listed["scheduled_date"], future_date)
+        self.assertEqual(listed["status"], "Scheduled")
+
+        past_date = (date.today() - timedelta(days=1)).isoformat()
+        rescheduled = self.client.post(
+            f"{endpoint}/schedule",
+            headers=officer,
+            json={"scheduled_date": past_date, "notes": "Visit date elapsed"},
+        )
+        self.assertEqual(rescheduled.status_code, 200)
+        self.assertEqual(rescheduled.json()["evc"]["status"], "Delayed")
+        overview = self.client.get("/api/evc", headers=officer).json()
+        self.assertEqual(overview["overdue_count"], 1)
+
+        rescheduled_future = self.client.post(
+            f"{endpoint}/schedule",
+            headers=officer,
+            json={"scheduled_date": future_date, "notes": "New visit date"},
+        )
+        self.assertEqual(rescheduled_future.status_code, 200)
+        self.assertEqual(rescheduled_future.json()["evc"]["status"], "Scheduled")
+        completed = self.client.post(
+            f"{endpoint}/complete",
+            headers=self.login("admin"),
+            json={"notes": "Visit completed."},
+        )
+        self.assertEqual(completed.status_code, 200)
+        evc = completed.json()["evc"]
+        self.assertEqual(evc["status"], "Completed")
+        self.assertIsNotNone(evc["completed_at"])
+        self.assertIn("Completion: Visit completed.", evc["notes"])
+
+        persistent = self.client.get("/api/evc", headers=officer).json()
+        persisted_evc = next(
+            item for item in persistent["evcs"]
+            if item["application_id"] == application_id
+        )
+        self.assertEqual(persisted_evc["status"], "Completed")
+        self.assertEqual(
+            self.client.post(f"{endpoint}/schedule", headers=officer, json={
+                "scheduled_date": future_date,
+            }).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.post(f"{endpoint}/complete", headers=officer, json={}).status_code,
+            409,
+        )
+
+        with main.connect_db() as connection:
+            actions = connection.execute("""
+                SELECT action, actor, timestamp
+                FROM audit_events
+                WHERE application_id = ? AND action LIKE 'EVC %'
+                ORDER BY id
+            """, (application_id,)).fetchall()
+            persisted = connection.execute(
+                "SELECT status, scheduled_date, completed_at FROM evc_tracking WHERE application_id = ?",
+                (application_id,),
+            ).fetchone()
+        self.assertEqual(
+            [row["action"] for row in actions],
+            ["EVC scheduled", "EVC rescheduled", "EVC rescheduled", "EVC completed"],
+        )
+        self.assertEqual([row["actor"] for row in actions], ["officer", "officer", "officer", "admin"])
+        self.assertTrue(all(row["timestamp"] for row in actions))
+        self.assertEqual(persisted["status"], "Completed")
+        self.assertEqual(persisted["scheduled_date"], future_date)
+        self.assertIsNotNone(persisted["completed_at"])
+
+    def test_evc_schedule_and_completion_reject_applications_without_evc_route(self):
+        application_id = "TEST-NO-EVC"
+        self.add_application(application_id, workflow_route="STANDARD")
+        officer = self.login("officer")
+        endpoint = f"/api/applications/{application_id}/evc"
+        self.assertEqual(
+            self.client.post(
+                f"{endpoint}/schedule",
+                headers=officer,
+                json={"scheduled_date": date.today().isoformat()},
+            ).status_code,
+            409,
+        )
+        self.assertEqual(
+            self.client.post(f"{endpoint}/complete", headers=officer, json={}).status_code,
+            409,
+        )
+
     def test_only_admin_can_create_applications(self):
         payload = self.create_payload("TEST-OFFICER-CREATE")
         self.assertEqual(

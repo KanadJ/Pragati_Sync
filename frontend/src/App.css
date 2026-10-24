@@ -107,6 +107,18 @@ footer { display: flex; justify-content: space-between; gap: 12px; color: #8994a
 .risk-detail { margin: 10px 0; padding: 11px; background: #f8fafc; border: 1px solid #e7ecf2; border-radius: 6px; }
 .risk-factor, .risk-gap { font-size: 11px; line-height: 1.5; margin: 8px 0 0; color: #526176; }
 .risk-gap { color: #7b8798; }
+.evc-counts { display: flex; flex-wrap: wrap; gap: 12px; }
+.evc-row { align-items: flex-start; }
+.evc-content { flex: 1; min-width: 0; }
+.evc-content > strong { font-size: 13px; }
+.evc-content > p { margin: 7px 0; color: #526176; font-size: 11px; }
+.evc-status-mark { width: 34px; height: 34px; flex: 0 0 auto; display: grid; place-items: center; border-radius: 50%; background: #edf4fc; color: #174a83; }
+.evc-delayed { background: #ffeded; color: #a93636; }
+.evc-completed { background: #e7f6ee; color: #18754f; }
+.evc-actions { display: grid; grid-template-columns: repeat(2, minmax(180px, 1fr)); align-items: end; gap: 10px; margin-top: 12px; max-width: 700px; }
+.evc-actions label { display: grid; gap: 5px; color: #526176; font-size: 11px; font-weight: 650; }
+.evc-actions input, .evc-actions textarea { width: 100%; min-width: 0; padding: 9px; border: 1px solid #d8dfe8; border-radius: 5px; color: #344358; background: #fff; font-size: 12px; }
+.evc-actions button { align-self: end; }
 .create-application-form { margin-bottom: 18px; }
 .create-application-form h3 { font-size: 15px; margin-bottom: 7px; }
 .create-fields-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
@@ -181,6 +193,7 @@ footer { display: flex; justify-content: space-between; gap: 12px; color: #8994a
   .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dashboard-summary-grid { grid-template-columns: 1fr; }
   .risk-overview-row { grid-template-columns: 1fr; align-items: start; }
+  .evc-actions { grid-template-columns: 1fr; }
   td, th { padding: 13px 10px; }
 }
 @media (max-width: 700px) {
