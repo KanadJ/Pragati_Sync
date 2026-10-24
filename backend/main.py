@@ -4,6 +4,7 @@ import hmac
 import json
 import secrets
 import sqlite3
+from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 from threading import Lock
@@ -151,10 +152,15 @@ def now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+@contextmanager
 def connect_db():
     connection = sqlite3.connect(DATABASE_PATH, timeout=10)
     connection.row_factory = sqlite3.Row
-    return connection
+    try:
+        with connection:
+            yield connection
+    finally:
+        connection.close()
 
 
 def initialize_database():
@@ -365,9 +371,10 @@ def auth_me(user=Depends(get_current_user)):
 
 
 @app.post("/api/auth/logout")
-def logout(authorization: str | None = Header(default=None)):
-    if not authorization or not authorization.startswith("Bearer "):
-        raise HTTPException(status_code=401, detail="Login required")
+def logout(
+    authorization: str | None = Header(default=None),
+    user=Depends(get_current_user),
+):
     token = authorization.removeprefix("Bearer ").strip()
     with SESSION_LOCK:
         SESSIONS.pop(token, None)
@@ -375,17 +382,17 @@ def logout(authorization: str | None = Header(default=None)):
 
 
 @app.get("/api/applications")
-def get_applications():
+def get_applications(user=Depends(get_current_user)):
     return get_all_applications()
 
 
 @app.get("/api/workflows")
-def get_workflows():
+def get_workflows(user=Depends(get_current_user)):
     return {"workflows": WORKFLOW_ROUTES}
 
 
 @app.get("/api/dashboard")
-def dashboard():
+def dashboard(user=Depends(get_current_user)):
     applications = get_all_applications()
     by_status = {}
     by_stage = {}
@@ -439,7 +446,10 @@ def dashboard():
 
 
 @app.get("/api/applications/{application_id}/history")
-def application_history(application_id: str):
+def application_history(
+    application_id: str,
+    user=Depends(get_current_user),
+):
     application = find_application(application_id)
     with connect_db() as connection:
         rows = connection.execute("""
@@ -456,7 +466,7 @@ def application_history(application_id: str):
 
 
 @app.get("/api/audit")
-def audit_trail(limit: int = 100):
+def audit_trail(limit: int = 100, user=Depends(get_current_user)):
     limit = max(1, min(limit, 500))
     with connect_db() as connection:
         rows = connection.execute("""
@@ -469,7 +479,7 @@ def audit_trail(limit: int = 100):
 
 
 @app.get("/api/monitoring")
-def compliance_monitoring():
+def compliance_monitoring(user=Depends(get_current_user)):
     today = date.today()
     results = []
 
