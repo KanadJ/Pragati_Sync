@@ -29,6 +29,15 @@ app.add_middleware(
 
 DATABASE_PATH = Path(__file__).resolve().parent / "aicte.db"
 ROUTING_RULES_PATH = Path(__file__).resolve().parent / "routing_rules.json"
+COMPLIANCE_SETTINGS_PATH = Path(__file__).resolve().parent / "compliance_settings.json"
+
+DOCUMENT_STATUSES = {"Pending", "Submitted", "Verified", "Rejected"}
+NOTIFICATION_CATEGORIES = {
+    "document_rejected",
+    "document_expiring",
+    "document_expired",
+    "application_overdue",
+}
 
 WORKFLOW_ROUTES = {
     "STANDARD": [
@@ -182,6 +191,42 @@ def initialize_database():
                 timestamp TEXT NOT NULL
             )
         """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                application_id TEXT NOT NULL,
+                document_type TEXT NOT NULL,
+                name TEXT NOT NULL,
+                status TEXT NOT NULL CHECK (
+                    status IN ('Pending', 'Submitted', 'Verified', 'Rejected')
+                ),
+                expiry_date TEXT,
+                reviewer_remarks TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            )
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_documents_application
+            ON documents(application_id)
+        """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS notifications (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                application_id TEXT NOT NULL,
+                category TEXT NOT NULL,
+                message TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                is_read INTEGER NOT NULL DEFAULT 0,
+                escalation_level INTEGER NOT NULL DEFAULT 0,
+                dedupe_key TEXT NOT NULL UNIQUE,
+                resolved_at TEXT
+            )
+        """)
+        connection.execute("""
+            CREATE INDEX IF NOT EXISTS idx_notifications_created
+            ON notifications(created_at DESC)
+        """)
         # Safe schema migration for existing databases.
         columns = {
             row["name"]
@@ -237,6 +282,88 @@ def get_all_applications():
             "SELECT data FROM applications ORDER BY id"
         ).fetchall()
     return [json.loads(row["data"]) for row in rows]
+
+
+def get_compliance_settings():
+    try:
+        with COMPLIANCE_SETTINGS_PATH.open(encoding="utf-8") as settings_file:
+            settings = json.load(settings_file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not load compliance settings: {error}",
+        ) from error
+
+    if not isinstance(settings, dict):
+        raise HTTPException(status_code=500, detail="Invalid compliance settings configuration")
+
+    warning_days = settings.get("expiry_warning_days")
+    required_types = settings.get("required_document_types")
+    escalation_days = settings.get("escalation_thresholds_days")
+    if (
+        not isinstance(warning_days, int)
+        or isinstance(warning_days, bool)
+        or warning_days < 0
+        or not isinstance(required_types, list)
+        or any(not isinstance(value, str) or not value.strip() for value in required_types)
+        or not isinstance(escalation_days, list)
+        or any(
+            not isinstance(value, int) or isinstance(value, bool) or value < 0
+            for value in escalation_days
+        )
+        or escalation_days != sorted(set(escalation_days))
+    ):
+        raise HTTPException(status_code=500, detail="Invalid compliance settings configuration")
+    return settings
+
+
+def list_application_documents(application_id):
+    with connect_db() as connection:
+        rows = connection.execute(
+            "SELECT * FROM documents WHERE application_id = ? ORDER BY id",
+            (application_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def calculate_compliance_summary(documents, settings, today=None):
+    today = today or date.today()
+    present_types = {
+        document["document_type"].strip().casefold()
+        for document in documents
+    }
+    missing_types = sorted(
+        document_type
+        for document_type in settings["required_document_types"]
+        if document_type.strip().casefold() not in present_types
+    )
+
+    if not documents or missing_types:
+        state = "Missing"
+    elif any(document["status"] == "Rejected" for document in documents):
+        state = "Rejected"
+    elif any(
+        (expiry := parse_date(document.get("expiry_date"))) and expiry < today
+        for document in documents
+    ):
+        state = "Expired"
+    elif any(document["status"] != "Verified" for document in documents):
+        state = "Pending Verification"
+    elif any(
+        (expiry := parse_date(document.get("expiry_date")))
+        and 0 <= (expiry - today).days <= settings["expiry_warning_days"]
+        for document in documents
+    ):
+        state = "Expiring Soon"
+    else:
+        state = "Compliant"
+
+    return {
+        "state": state,
+        "document_count": len(documents),
+        "missing_document_types": missing_types,
+        "expiry_warning_days": settings["expiry_warning_days"],
+    }
 
 
 def find_application(application_id):
@@ -398,6 +525,183 @@ def parse_date(value):
         return date.fromisoformat(value)
     except (TypeError, ValueError):
         return None
+
+
+def notification_event(application_id, category, message, dedupe_key, actor):
+    created_at = now_iso()
+    with connect_db() as connection:
+        cursor = connection.execute("""
+            INSERT OR IGNORE INTO notifications
+                (application_id, category, message, created_at, dedupe_key)
+            VALUES (?, ?, ?, ?, ?)
+        """, (application_id, category, message, created_at, dedupe_key))
+        created = cursor.rowcount == 1
+        if not created:
+            existing = connection.execute(
+                "SELECT id, resolved_at FROM notifications WHERE dedupe_key = ?",
+                (dedupe_key,),
+            ).fetchone()
+            if existing and existing["resolved_at"] is not None:
+                connection.execute("""
+                    UPDATE notifications
+                    SET message = ?, created_at = ?, is_read = 0,
+                        escalation_level = 0, resolved_at = NULL
+                    WHERE id = ?
+                """, (message, created_at, existing["id"]))
+                created = True
+
+    if created:
+        application = find_application(application_id)
+        record_event(
+            application,
+            "Notification created",
+            application.get("stage"),
+            f"{category}: {message}",
+            actor,
+        )
+    return created
+
+
+def run_compliance_check(as_of=None, actor="System"):
+    as_of = as_of or date.today()
+    settings = get_compliance_settings()
+    active_keys = set()
+    created_count = 0
+    escalated_count = 0
+
+    for application in get_all_applications():
+        application_id = application["id"]
+        documents = list_application_documents(application_id)
+
+        for document in documents:
+            document_id = document["id"]
+            status = document["status"]
+            expiry = parse_date(document.get("expiry_date"))
+            if status == "Rejected":
+                key = f"document_rejected:{document_id}:{document['updated_at']}"
+                message = (
+                    f"{document['document_type']} ({document['name']}) was rejected. "
+                    f"Reviewer remarks: {document.get('reviewer_remarks') or 'Not provided'}"
+                )
+                active_keys.add(key)
+                created_count += notification_event(
+                    application_id, "document_rejected", message, key, actor
+                )
+
+            if expiry and expiry < as_of:
+                key = f"document_expired:{document_id}:{expiry.isoformat()}"
+                message = f"{document['document_type']} ({document['name']}) expired on {expiry.isoformat()}."
+                active_keys.add(key)
+                created_count += notification_event(
+                    application_id, "document_expired", message, key, actor
+                )
+            elif (
+                expiry
+                and status == "Verified"
+                and 0 <= (expiry - as_of).days <= settings["expiry_warning_days"]
+            ):
+                key = f"document_expiring:{document_id}:{expiry.isoformat()}"
+                message = (
+                    f"{document['document_type']} ({document['name']}) expires "
+                    f"on {expiry.isoformat()}."
+                )
+                active_keys.add(key)
+                created_count += notification_event(
+                    application_id, "document_expiring", message, key, actor
+                )
+
+        due = parse_date(application.get("due_date"))
+        if due and due < as_of and not is_completed(application):
+            key = f"application_overdue:{application_id}:{due.isoformat()}"
+            active_keys.add(key)
+            created_count += notification_event(
+                application_id,
+                "application_overdue",
+                f"Application deadline passed on {due.isoformat()}.",
+                key,
+                actor,
+            )
+
+        application_expiry = parse_date(application.get("document_expiry_date"))
+        if application_expiry and application_expiry < as_of:
+            key = f"document_expired:application:{application_id}:{application_expiry.isoformat()}"
+            active_keys.add(key)
+            created_count += notification_event(
+                application_id,
+                "document_expired",
+                f"Application compliance document expired on {application_expiry.isoformat()}.",
+                key,
+                actor,
+            )
+        elif (
+            application_expiry
+            and 0 <= (application_expiry - as_of).days <= settings["expiry_warning_days"]
+        ):
+            key = f"document_expiring:application:{application_id}:{application_expiry.isoformat()}"
+            active_keys.add(key)
+            created_count += notification_event(
+                application_id,
+                "document_expiring",
+                f"Application compliance document expires on {application_expiry.isoformat()}.",
+                key,
+                actor,
+            )
+
+    with connect_db() as connection:
+        unresolved = connection.execute(
+            "SELECT * FROM notifications WHERE resolved_at IS NULL"
+        ).fetchall()
+    for notification in unresolved:
+        if notification["dedupe_key"] not in active_keys:
+            with connect_db() as connection:
+                connection.execute(
+                    "UPDATE notifications SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL",
+                    (now_iso(), notification["id"]),
+                )
+            application = find_application(notification["application_id"])
+            record_event(
+                application,
+                "Notification resolved",
+                application.get("stage"),
+                f"Notification {notification['id']} ({notification['category']}) is no longer active.",
+                actor,
+            )
+            continue
+
+        created = datetime.fromisoformat(notification["created_at"])
+        if created.tzinfo is None:
+            created = created.replace(tzinfo=timezone.utc)
+        elapsed_days = max(0, (as_of - created.date()).days)
+        level = sum(
+            1 for threshold in settings["escalation_thresholds_days"]
+            if elapsed_days >= threshold
+        )
+        if level > notification["escalation_level"]:
+            with connect_db() as connection:
+                connection.execute(
+                    "UPDATE notifications SET escalation_level = ? WHERE id = ?",
+                    (level, notification["id"]),
+                )
+            application = find_application(notification["application_id"])
+            record_event(
+                application,
+                "Notification escalated",
+                application.get("stage"),
+                f"Notification {notification['id']} ({notification['category']}) escalated to level {level}.",
+                actor,
+            )
+            escalated_count += 1
+
+    with connect_db() as connection:
+        active_count = connection.execute(
+            "SELECT COUNT(*) FROM notifications WHERE resolved_at IS NULL"
+        ).fetchone()[0]
+    return {
+        "checked_on": as_of.isoformat(),
+        "created": created_count,
+        "escalated": escalated_count,
+        "active_notifications": active_count,
+    }
 
 
 @app.on_event("startup")
@@ -645,6 +949,238 @@ def application_history(
     return {"application_id": application_id, "history": events}
 
 
+@app.get("/api/applications/{application_id}/documents")
+def get_documents(
+    application_id: str,
+    user=Depends(get_current_user),
+):
+    find_application(application_id)
+    documents = list_application_documents(application_id)
+    settings = get_compliance_settings()
+    summary = calculate_compliance_summary(documents, settings)
+    return {
+        "application_id": application_id,
+        "documents": documents,
+        "compliance": summary,
+    }
+
+
+@app.post("/api/applications/{application_id}/documents", status_code=201)
+def create_document(
+    application_id: str,
+    payload: dict = Body(...),
+    user=Depends(require_roles("Admin", "Officer")),
+):
+    application = find_application(application_id)
+    allowed = {
+        "document_type", "name", "status", "expiry_date", "reviewer_remarks",
+    }
+    if set(payload) - allowed:
+        raise HTTPException(status_code=400, detail="Unsupported document fields")
+
+    for field in ("document_type", "name"):
+        value = payload.get(field)
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field} must be a non-empty string",
+            )
+
+    status = payload.get("status", "Pending")
+    if not isinstance(status, str) or status not in DOCUMENT_STATUSES:
+        raise HTTPException(
+            status_code=400,
+            detail=f"status must be one of: {', '.join(sorted(DOCUMENT_STATUSES))}",
+        )
+    expiry = payload.get("expiry_date")
+    if expiry is not None and (
+        not isinstance(expiry, str)
+        or parse_date(expiry) is None
+        or parse_date(expiry).isoformat() != expiry
+    ):
+        raise HTTPException(status_code=400, detail="expiry_date must be a valid YYYY-MM-DD date or null")
+    remarks = payload.get("reviewer_remarks")
+    if remarks is not None and not isinstance(remarks, str):
+        raise HTTPException(status_code=400, detail="reviewer_remarks must be a string or null")
+    if status == "Rejected" and not (remarks or "").strip():
+        raise HTTPException(status_code=400, detail="Reviewer remarks are required for rejection")
+
+    timestamp = now_iso()
+    with connect_db() as connection:
+        cursor = connection.execute("""
+            INSERT INTO documents
+                (application_id, document_type, name, status, expiry_date,
+                 reviewer_remarks, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            application_id, payload["document_type"].strip(), payload["name"].strip(),
+            status, expiry, remarks.strip() if remarks else None,
+            timestamp, timestamp,
+        ))
+        document_id = cursor.lastrowid
+
+    record_event(
+        application,
+        "Document created",
+        application.get("stage"),
+        f"Document {document_id}: {payload['document_type'].strip()} / {payload['name'].strip()} ({status})",
+        user["username"],
+    )
+    run_compliance_check(actor=user["username"])
+    with connect_db() as connection:
+        document = dict(connection.execute(
+            "SELECT * FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone())
+    return {"document": document}
+
+
+@app.patch("/api/applications/{application_id}/documents/{document_id}")
+def update_document(
+    application_id: str,
+    document_id: int,
+    payload: dict = Body(...),
+    user=Depends(require_roles("Admin", "Officer")),
+):
+    application = find_application(application_id)
+    allowed = {
+        "document_type", "name", "status", "expiry_date", "reviewer_remarks",
+    }
+    if not payload or set(payload) - allowed:
+        raise HTTPException(status_code=400, detail="Provide valid document fields to update")
+    with connect_db() as connection:
+        row = connection.execute(
+            "SELECT * FROM documents WHERE id = ? AND application_id = ?",
+            (document_id, application_id),
+        ).fetchone()
+    if row is None:
+        raise HTTPException(status_code=404, detail="Document not found")
+
+    document = dict(row)
+    updates = {}
+    for field in ("document_type", "name"):
+        if field in payload:
+            value = payload[field]
+            if not isinstance(value, str) or not value.strip():
+                raise HTTPException(status_code=400, detail=f"{field} must be a non-empty string")
+            updates[field] = value.strip()
+    if "status" in payload:
+        if not isinstance(payload["status"], str) or payload["status"] not in DOCUMENT_STATUSES:
+            raise HTTPException(
+                status_code=400,
+                detail=f"status must be one of: {', '.join(sorted(DOCUMENT_STATUSES))}",
+            )
+        updates["status"] = payload["status"]
+    if "expiry_date" in payload:
+        expiry = payload["expiry_date"]
+        if expiry is not None and (
+            not isinstance(expiry, str)
+            or parse_date(expiry) is None
+            or parse_date(expiry).isoformat() != expiry
+        ):
+            raise HTTPException(status_code=400, detail="expiry_date must be a valid YYYY-MM-DD date or null")
+        updates["expiry_date"] = expiry
+    if "reviewer_remarks" in payload:
+        remarks = payload["reviewer_remarks"]
+        if remarks is not None and not isinstance(remarks, str):
+            raise HTTPException(status_code=400, detail="reviewer_remarks must be a string or null")
+        updates["reviewer_remarks"] = remarks.strip() if remarks else None
+
+    final_status = updates.get("status", document["status"])
+    final_remarks = updates.get("reviewer_remarks", document["reviewer_remarks"])
+    if final_status == "Rejected" and not (final_remarks or "").strip():
+        raise HTTPException(status_code=400, detail="Reviewer remarks are required for rejection")
+    updates["updated_at"] = now_iso()
+
+    assignments = ", ".join(f"{field} = ?" for field in updates)
+    with connect_db() as connection:
+        connection.execute(
+            f"UPDATE documents SET {assignments} WHERE id = ? AND application_id = ?",
+            (*updates.values(), document_id, application_id),
+        )
+    record_event(
+        application,
+        "Document updated",
+        application.get("stage"),
+        f"Document {document_id} updated: {json.dumps(updates, sort_keys=True)}",
+        user["username"],
+    )
+    run_compliance_check(actor=user["username"])
+    with connect_db() as connection:
+        updated = dict(connection.execute(
+            "SELECT * FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone())
+    return {"document": updated}
+
+
+@app.get("/api/applications/{application_id}/compliance-summary")
+def application_compliance_summary(
+    application_id: str,
+    user=Depends(get_current_user),
+):
+    find_application(application_id)
+    documents = list_application_documents(application_id)
+    return calculate_compliance_summary(documents, get_compliance_settings())
+
+
+@app.get("/api/notifications")
+def get_notifications(
+    unread_only: bool = False,
+    user=Depends(get_current_user),
+):
+    query = """
+        SELECT id, application_id, category, message, created_at, is_read,
+               escalation_level, resolved_at
+        FROM notifications
+    """
+    if unread_only:
+        query += " WHERE is_read = 0"
+    query += " ORDER BY created_at DESC, id DESC LIMIT 500"
+    with connect_db() as connection:
+        rows = connection.execute(query).fetchall()
+    return {"notifications": [dict(row) for row in rows]}
+
+
+@app.post("/api/notifications/{notification_id}/read")
+def mark_notification_read(
+    notification_id: int,
+    user=Depends(require_roles("Admin", "Officer")),
+):
+    with connect_db() as connection:
+        notification = connection.execute(
+            "SELECT * FROM notifications WHERE id = ?",
+            (notification_id,),
+        ).fetchone()
+        if notification is None:
+            raise HTTPException(status_code=404, detail="Notification not found")
+        if not notification["is_read"]:
+            connection.execute(
+                "UPDATE notifications SET is_read = 1 WHERE id = ?",
+                (notification_id,),
+            )
+    if not notification["is_read"]:
+        application = find_application(notification["application_id"])
+        record_event(
+            application,
+            "Notification marked read",
+            application.get("stage"),
+            f"Notification {notification_id} ({notification['category']}) marked read.",
+            user["username"],
+        )
+    with connect_db() as connection:
+        updated = dict(connection.execute(
+            "SELECT id, application_id, category, message, created_at, is_read, escalation_level, resolved_at FROM notifications WHERE id = ?",
+            (notification_id,),
+        ).fetchone())
+    return {"notification": updated}
+
+
+@app.post("/api/compliance/check")
+def compliance_check(user=Depends(require_roles("Admin"))):
+    return run_compliance_check(actor=user["username"])
+
+
 @app.get("/api/audit")
 def audit_trail(limit: int = 100, user=Depends(get_current_user)):
     limit = max(1, min(limit, 500))
@@ -662,6 +1198,7 @@ def audit_trail(limit: int = 100, user=Depends(get_current_user)):
 def compliance_monitoring(user=Depends(get_current_user)):
     today = date.today()
     results = []
+    settings = get_compliance_settings()
 
     for application in get_all_applications():
         due_value = application.get("due_date")
@@ -708,6 +1245,27 @@ def compliance_monitoring(user=Depends(get_current_user)):
                 "message": "Document expires within 30 days",
             })
 
+        documents = list_application_documents(application["id"])
+        summary = calculate_compliance_summary(documents, settings, today)
+        for document in documents:
+            document_expiry = parse_date(document.get("expiry_date"))
+            if document_expiry and document_expiry < today:
+                alerts.append({
+                    "severity": "Critical",
+                    "type": "Document expired",
+                    "message": f"{document['document_type']} ({document['name']}) expired on {document_expiry.isoformat()}",
+                })
+            elif (
+                document_expiry
+                and document["status"] == "Verified"
+                and 0 <= (document_expiry - today).days <= settings["expiry_warning_days"]
+            ):
+                alerts.append({
+                    "severity": "Warning",
+                    "type": "Document expiring",
+                    "message": f"{document['document_type']} ({document['name']}) expires on {document_expiry.isoformat()}",
+                })
+
         if not due_value and not expiry_value:
             alerts.append({
                 "severity": "Info",
@@ -722,8 +1280,10 @@ def compliance_monitoring(user=Depends(get_current_user)):
             "status": application.get("status"),
             "due_date": due_value,
             "document_expiry_date": expiry_value,
+            "compliance_state": summary["state"],
+            "documents_count": summary["document_count"],
             "alerts": alerts,
-            "compliance_configured": bool(due_value or expiry_value),
+            "compliance_configured": bool(due_value or expiry_value or documents),
         })
 
     return {
@@ -912,6 +1472,7 @@ def update_compliance(
         application, "Compliance dates updated", application["stage"],
         json.dumps(payload), user["username"],
     )
+    run_compliance_check(actor=user["username"])
     return {
         "message": "Compliance dates updated",
         "application": find_application(application_id),

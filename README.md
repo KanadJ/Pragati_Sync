@@ -71,6 +71,50 @@ Routing metadata is stored inside the existing application JSON record and
 workflow events use the existing audit table. No database schema changes or
 migrations are required for this feature.
 
+## Document register and compliance notifications
+
+Application detail panels include a document register. Admins and Officers
+can add or update document type, name, status, expiry date, and reviewer
+remarks; Viewers can read document records and compliance summaries only.
+Supported statuses are `Pending`, `Submitted`, `Verified`, and `Rejected`.
+Submission is not verification, and a rejection must include reviewer remarks.
+Document changes and notification creation, resolution, escalation, and
+read-status changes are recorded through the existing audit history.
+
+`GET /api/applications/{application_id}/documents` returns the document
+register and its compliance summary. The summary states are `Missing`,
+`Pending Verification`, `Rejected`, `Expiring Soon`, `Expired`, and
+`Compliant`; an empty register or an unverified document is never compliant.
+`GET /api/applications/{application_id}/compliance-summary` returns just the
+summary.
+
+Warning windows, required document types, and escalation thresholds are
+configured in `backend/compliance_settings.json`. These are **demo settings**,
+not validated AICTE requirements. The default has a 30-day expiry warning,
+no configured required document types, and escalation thresholds at 3 and 7
+days. With no authoritative required-document list configured, `Compliant`
+only describes the documents recorded in the prototype as verified; it does
+not certify institutional compliance.
+
+`GET /api/notifications` lists persisted in-app notifications. Admin and
+Officer may mark a notification read through
+`POST /api/notifications/{notification_id}/read`; Viewers can read the list
+but cannot change read status. Document rejection, expiry, and overdue
+application deadlines are checked when relevant document/compliance data is
+changed. Admins can also invoke `POST /api/compliance/check` from Monitoring
+to check all applications and advance unresolved notifications through the
+configured escalation thresholds. Repeated checks are deduplicated by issue
+and do not continuously create duplicate notifications.
+
+There is **no background scheduler** in this prototype. To periodically check
+deadlines and escalate unresolved notifications, an authorized operator must
+invoke the Admin-only check endpoint periodically, or an external deployment
+job must call it using a valid session. The endpoint is local/in-app only;
+email, SMS, institution-scoped visibility, and an automated schedule are not
+implemented. The new `documents` and `notifications` tables and their indexes
+are created idempotently at startup; existing application and audit records
+are preserved, and this feature requires no database reset or migration.
+
 ## Demo accounts
 
 These fixed credentials are for local demonstration only:

@@ -25,6 +25,15 @@ function App() {
   const [workflows, setWorkflows] = useState({})
   const [auditEvents, setAuditEvents] = useState([])
   const [monitoring, setMonitoring] = useState(null)
+  const [notifications, setNotifications] = useState([])
+  const [documents, setDocuments] = useState([])
+  const [complianceSummary, setComplianceSummary] = useState(null)
+  const [documentEdits, setDocumentEdits] = useState({})
+  const [documentDraft, setDocumentDraft] = useState({
+    document_type: '',
+    name: '',
+    expiry_date: '',
+  })
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
   const [selectedId, setSelectedId] = useState('')
@@ -89,18 +98,20 @@ function App() {
   }, [token])
 
   const refreshData = useCallback(async () => {
-    const [apps, workflowData, auditData, monitoringData] =
+    const [apps, workflowData, auditData, monitoringData, notificationData] =
       await Promise.all([
         request('/api/applications'),
         request('/api/workflows'),
         request('/api/audit'),
         request('/api/monitoring'),
+        request('/api/notifications'),
       ])
 
     setApplications(apps)
     setWorkflows(workflowData.workflows || {})
     setAuditEvents(auditData.events || [])
     setMonitoring(monitoringData)
+    setNotifications(notificationData.notifications || [])
 
     setSelectedId((current) => {
       if (current && apps.some((item) => item.id === current)) return current
@@ -209,6 +220,9 @@ function App() {
     setWorkflows({})
     setAuditEvents([])
     setMonitoring(null)
+    setNotifications([])
+    setDocuments([])
+    setComplianceSummary(null)
     setSelectedId('')
     setShowReturn(false)
     setNotice('')
@@ -222,6 +236,49 @@ function App() {
     setDueDate(selected?.due_date || '')
     setExpiryDate(selected?.document_expiry_date || '')
   }, [selectedId, selected?.due_date, selected?.document_expiry_date])
+
+  const refreshDocuments = useCallback(async () => {
+    if (!selectedId) return
+    const data = await request(`/api/applications/${encodeURIComponent(selectedId)}/documents`)
+    setDocuments(data.documents || [])
+    setComplianceSummary(data.compliance || null)
+    setDocumentEdits(Object.fromEntries((data.documents || []).map((document) => [
+      document.id,
+      {
+        document_type: document.document_type,
+        name: document.name,
+        status: document.status,
+        expiry_date: document.expiry_date || '',
+        reviewer_remarks: document.reviewer_remarks || '',
+      },
+    ])))
+  }, [request, selectedId])
+
+  useEffect(() => {
+    if (!user || !selectedId) return undefined
+    let active = true
+    Promise.resolve()
+      .then(() => request(`/api/applications/${encodeURIComponent(selectedId)}/documents`))
+      .then((data) => {
+        if (!active) return
+        setDocuments(data.documents || [])
+        setComplianceSummary(data.compliance || null)
+        setDocumentEdits(Object.fromEntries((data.documents || []).map((document) => [
+          document.id,
+          {
+            document_type: document.document_type,
+            name: document.name,
+            status: document.status,
+            expiry_date: document.expiry_date || '',
+            reviewer_remarks: document.reviewer_remarks || '',
+          },
+        ])))
+      })
+      .catch((error) => {
+        if (active) setNotice(`Could not load document register: ${error.message}`)
+      })
+    return () => { active = false }
+  }, [request, selectedId, user])
 
   const filtered = useMemo(() => {
     const query = search.toLowerCase()
@@ -344,7 +401,81 @@ function App() {
       )
 
       await refreshData()
+      await refreshDocuments()
       setNotice('Compliance dates saved.')
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function createDocument(event) {
+    event.preventDefault()
+    if (!selected || !canProcess || busy) return
+    setBusy(true)
+    setNotice('')
+    try {
+      await request(`/api/applications/${encodeURIComponent(selected.id)}/documents`, {
+        method: 'POST',
+        body: JSON.stringify({
+          ...documentDraft,
+          expiry_date: documentDraft.expiry_date || null,
+        }),
+      })
+      setDocumentDraft({ document_type: '', name: '', expiry_date: '' })
+      await refreshDocuments()
+      await refreshData()
+      setNotice('Document added to the register.')
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function updateDocument(documentId) {
+    if (!canProcess || busy) return
+    setBusy(true)
+    setNotice('')
+    const edit = documentEdits[documentId] || {}
+    try {
+      await request(`/api/applications/${encodeURIComponent(selected.id)}/documents/${documentId}`, {
+        method: 'PATCH',
+        body: JSON.stringify({
+          ...edit,
+          expiry_date: edit.expiry_date || null,
+          reviewer_remarks: edit.reviewer_remarks || null,
+        }),
+      })
+      await refreshDocuments()
+      await refreshData()
+      setNotice('Document record updated.')
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function markNotificationRead(notificationId) {
+    if (!canProcess) return
+    try {
+      await request(`/api/notifications/${notificationId}/read`, { method: 'POST' })
+      await refreshData()
+    } catch (error) {
+      setNotice(error.message)
+    }
+  }
+
+  async function runComplianceCheck() {
+    if (!isAdmin || busy) return
+    setBusy(true)
+    setNotice('')
+    try {
+      const result = await request('/api/compliance/check', { method: 'POST' })
+      await refreshData()
+      setNotice(`Compliance check complete: ${result.created} new notification(s), ${result.escalated} escalation(s).`)
     } catch (error) {
       setNotice(error.message)
     } finally {
@@ -493,6 +624,7 @@ function App() {
           ['Dashboard', '▦'],
           ['Applications', '▤'],
           ['Monitoring', '◷'],
+          ['Notifications', '♢'],
           ['Audit Trail', '≡'],
         ].map(([name, symbol]) => (
           <button
@@ -501,7 +633,7 @@ function App() {
             onClick={() => { setPage(name); setNotice('') }}
           >
             <span className="nav-symbol">{symbol}</span>
-            {name}
+            {name}{name === 'Notifications' && notifications.some((item) => !item.is_read) ? ` (${notifications.filter((item) => !item.is_read).length})` : ''}
           </button>
         ))}
 
@@ -668,7 +800,10 @@ function App() {
               </div>
 
               <div className="panel monitoring-panel">
-                <h2>Compliance monitoring</h2>
+                <div className="section-heading">
+                  <div><h2>Compliance monitoring</h2><p>Demo warning and escalation thresholds; validate before operational use.</p></div>
+                  {isAdmin && <button className="secondary-button" disabled={busy} onClick={runComplianceCheck}>Run compliance check</button>}
+                </div>
                 <p className="muted">
                   {monitoring ? `Checked on ${monitoring.checked_on}. Set dates in an application's review panel.` : 'Loading compliance data...'}
                 </p>
@@ -686,6 +821,7 @@ function App() {
                       <div>
                         <strong>{item.institution}</strong>
                         <p>{item.id} · {item.stage}</p>
+                        <p>Document-register status: <strong>{item.compliance_state || 'Unknown'}</strong> · {item.documents_count || 0} document(s)</p>
                         <span>
                           Deadline: {item.due_date || 'Not set'} · Document expiry: {item.document_expiry_date || 'Not set'}
                         </span>
@@ -709,6 +845,36 @@ function App() {
                 )}
               </div>
             </>
+          )}
+
+          {page === 'Notifications' && (
+            <div className="panel">
+              <div className="section-heading">
+                <div><h2>In-app notifications</h2><p>Compliance alerts and deadline escalations linked to applications.</p></div>
+                <span className="record-count">{notifications.filter((item) => !item.is_read).length} unread</span>
+              </div>
+              {notifications.length === 0 ? (
+                <div className="empty-state">No notifications have been generated. Admins can run a compliance check from Monitoring.</div>
+              ) : notifications.map((item) => (
+                <div className={`audit-row notification-row ${item.is_read ? 'notification-read' : ''}`} key={item.id}>
+                  <div className="audit-icon">{item.is_read ? '✓' : '!'}</div>
+                  <div>
+                    <strong>{item.category.replaceAll('_', ' ')} · escalation {item.escalation_level}</strong>
+                    <p>{item.message}</p>
+                    <span>{item.application_id} · {new Date(item.created_at).toLocaleString()} · {item.resolved_at ? 'Resolved' : item.is_read ? 'Read' : 'Unread'}</span>
+                    <div className="form-actions">
+                      <button className="secondary-button" onClick={() => {
+                        setSelectedId(item.application_id)
+                        setPage('Applications')
+                      }}>Open application</button>
+                      {!item.is_read && canProcess && (
+                        <button className="secondary-button" onClick={() => markNotificationRead(item.id)}>Mark read</button>
+                      )}
+                    </div>
+                  </div>
+                </div>
+              ))}
+            </div>
           )}
 
           {page === 'Audit Trail' && (
@@ -863,6 +1029,93 @@ function App() {
                 </button>
               )}
               {!canProcess && <p className="muted">Viewer access is read-only.</p>}
+            </div>
+
+            <div className="panel document-register" style={{ marginTop: 16 }}>
+              <div className="section-heading">
+                <div>
+                  <h3>Document register</h3>
+                  <p>Compliance status: <strong>{complianceSummary?.state || 'Loading'}</strong></p>
+                </div>
+                <span className="record-count">{documents.length} record(s)</span>
+              </div>
+
+              {documents.length === 0 ? (
+                <p className="muted">No documents recorded. An empty register is not compliant.</p>
+              ) : documents.map((document) => {
+                const edit = documentEdits[document.id] || {}
+                return (
+                  <div className="document-row" key={document.id}>
+                    <span>Created {new Date(document.created_at).toLocaleDateString()}</span>
+                    <label>Document type
+                      <input
+                        value={edit.document_type ?? document.document_type}
+                        disabled={!canProcess || busy}
+                        onChange={(event) => setDocumentEdits((current) => ({
+                          ...current,
+                          [document.id]: { ...current[document.id], document_type: event.target.value },
+                        }))}
+                      />
+                    </label>
+                    <label>Name
+                      <input
+                        value={edit.name ?? document.name}
+                        disabled={!canProcess || busy}
+                        onChange={(event) => setDocumentEdits((current) => ({
+                          ...current,
+                          [document.id]: { ...current[document.id], name: event.target.value },
+                        }))}
+                      />
+                    </label>
+                    <label>Status
+                      <select
+                        value={edit.status || document.status}
+                        disabled={!canProcess || busy}
+                        onChange={(event) => setDocumentEdits((current) => ({
+                          ...current,
+                          [document.id]: { ...current[document.id], status: event.target.value },
+                        }))}
+                      >
+                        {['Pending', 'Submitted', 'Verified', 'Rejected'].map((status) => <option key={status}>{status}</option>)}
+                      </select>
+                    </label>
+                    <label>Expiry date
+                      <input
+                        type="date"
+                        value={edit.expiry_date ?? document.expiry_date ?? ''}
+                        disabled={!canProcess || busy}
+                        onChange={(event) => setDocumentEdits((current) => ({
+                          ...current,
+                          [document.id]: { ...current[document.id], expiry_date: event.target.value },
+                        }))}
+                      />
+                    </label>
+                    <label>Reviewer remarks
+                      <textarea
+                        rows={2}
+                        value={edit.reviewer_remarks ?? document.reviewer_remarks ?? ''}
+                        disabled={!canProcess || busy}
+                        onChange={(event) => setDocumentEdits((current) => ({
+                          ...current,
+                          [document.id]: { ...current[document.id], reviewer_remarks: event.target.value },
+                        }))}
+                      />
+                    </label>
+                    {canProcess && <button className="secondary-button" disabled={busy} onClick={() => updateDocument(document.id)}>Save document</button>}
+                  </div>
+                )
+              })}
+
+              {canProcess && (
+                <form className="document-create-form" onSubmit={createDocument}>
+                  <h4>Add document</h4>
+                  <label>Document type<input value={documentDraft.document_type} required onChange={(event) => setDocumentDraft((draft) => ({ ...draft, document_type: event.target.value }))} /></label>
+                  <label>Name<input value={documentDraft.name} required onChange={(event) => setDocumentDraft((draft) => ({ ...draft, name: event.target.value }))} /></label>
+                  <label>Expiry date<input type="date" value={documentDraft.expiry_date} onChange={(event) => setDocumentDraft((draft) => ({ ...draft, expiry_date: event.target.value }))} /></label>
+                  <button className="primary-button" type="submit" disabled={busy}>Add as pending</button>
+                  <p className="muted">Submission does not mean verification. Rejection requires reviewer remarks.</p>
+                </form>
+              )}
             </div>
 
             <div className="workflow-section">

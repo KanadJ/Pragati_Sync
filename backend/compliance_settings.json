@@ -1,0 +1,6 @@
+{
+  "notice": "DEMO SETTINGS ONLY. Validate document requirements, expiry warning periods, and escalation timelines against current official AICTE requirements before operational use.",
+  "expiry_warning_days": 30,
+  "required_document_types": [],
+  "escalation_thresholds_days": [3, 7]
+}
