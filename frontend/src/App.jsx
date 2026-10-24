@@ -32,6 +32,18 @@ function App() {
   const [filter, setFilter] = useState('All')
   const [returnReason, setReturnReason] = useState('')
   const [showReturn, setShowReturn] = useState(false)
+  const [showCreateApplication, setShowCreateApplication] = useState(false)
+  const [createBusy, setCreateBusy] = useState(false)
+  const [newApplication, setNewApplication] = useState({
+    id: '',
+    institution: '',
+    region: '',
+    officer: '',
+    date: '',
+    requires_scrutiny: false,
+    requires_evc: false,
+    requires_sac_shc: false,
+  })
   const [dueDate, setDueDate] = useState('')
   const [expiryDate, setExpiryDate] = useState('')
   const [notice, setNotice] = useState('')
@@ -43,7 +55,7 @@ function App() {
   const canEditWorkflow = isAdmin
 
   const request = useCallback(async (path, options = {}) => {
-    const currentToken = localStorage.getItem(TOKEN_KEY)
+    const currentToken = token || localStorage.getItem(TOKEN_KEY)
 
     const response = await fetch(`${API}${path}`, {
       ...options,
@@ -74,7 +86,7 @@ function App() {
     }
 
     return data
-  }, [])
+  }, [token])
 
   const refreshData = useCallback(async () => {
     const [apps, workflowData, auditData, monitoringData] =
@@ -269,7 +281,7 @@ function App() {
         ? { method: 'POST', body: JSON.stringify({ reason }) }
         : { method: 'POST' }
 
-      await request(
+      const result = await request(
         `/api/applications/${encodeURIComponent(selected.id)}/${action}`,
         options
       )
@@ -277,11 +289,15 @@ function App() {
       await refreshData()
       setShowReturn(false)
       setReturnReason('')
-      setNotice(
-        action === 'advance'
-          ? 'Application stage updated successfully.'
-          : 'Application returned successfully. Audit history saved.'
-      )
+      const decision = result.routing_decision
+      const successMessage = action === 'auto-route' && decision
+        ? `Auto-assigned ${decision.route} using ${decision.rule_id}: ${decision.reason}`
+        : {
+            advance: 'Application stage updated successfully.',
+            return: 'Application returned successfully. Audit history saved.',
+            resubmit: 'Corrections resubmitted. The workflow can continue.',
+          }[action] || 'Application workflow updated successfully.'
+      setNotice(successMessage)
     } catch (error) {
       setNotice(error.message)
     } finally {
@@ -336,9 +352,67 @@ function App() {
     }
   }
 
+  async function createApplication(event) {
+    event.preventDefault()
+    if (!isAdmin || createBusy) return
+
+    setCreateBusy(true)
+    setNotice('')
+    try {
+      const payload = {
+        ...newApplication,
+        id: newApplication.id.trim(),
+        institution: newApplication.institution.trim(),
+        region: newApplication.region.trim(),
+        officer: newApplication.officer.trim(),
+      }
+      const result = await request('/api/applications', {
+        method: 'POST',
+        body: JSON.stringify(payload),
+      })
+      await refreshData()
+      setSelectedId(result.application.id)
+      setShowCreateApplication(false)
+      setPage('Applications')
+      setNewApplication({
+        id: '',
+        institution: '',
+        region: '',
+        officer: '',
+        date: '',
+        requires_scrutiny: false,
+        requires_evc: false,
+        requires_sac_shc: false,
+      })
+      setNotice(`Application ${result.application.id} created. Assign its route automatically from the application panel.`)
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setCreateBusy(false)
+    }
+  }
+
   const selectedAudit = auditEvents.filter(
     (event) => event.application_id === selectedId
   )
+  const selectedRoute = workflows[selected?.workflow_route] || FALLBACK_STAGES
+  const hasWorkflowHistory = Boolean(
+    selected?.history?.some((event) => event.action !== 'Application created')
+    || selectedAudit.some((event) => event.action !== 'Application created')
+  )
+  const canAssignWorkflow = Boolean(
+    isAdmin
+    && selected?.status === 'Pending'
+    && selected.stage === selectedRoute[0]
+    && !hasWorkflowHistory
+  )
+  const routingUnavailableReason = selected?.status !== 'Pending'
+    ? 'Automatic routing is only available for pending applications.'
+    : selected?.stage !== selectedRoute[0]
+      ? 'This application has already passed its initial workflow stage.'
+      : hasWorkflowHistory
+        ? 'This application already has audit history and its route is locked.'
+        : ''
 
   if (authChecking) {
     return <div className="app-shell"><main className="main-content"><div className="notice">Checking your session...</div></main></div>
@@ -498,7 +572,87 @@ function App() {
             <>
               <div className="section-heading">
                 <div><h2>All applications</h2><p>Choose a record to open its review panel.</p></div>
+                {isAdmin && (
+                  <button
+                    className="primary-button"
+                    onClick={() => setShowCreateApplication((visible) => !visible)}
+                  >
+                    {showCreateApplication ? 'Cancel' : 'Create application'}
+                  </button>
+                )}
               </div>
+              {isAdmin && showCreateApplication && (
+                <form className="panel create-application-form" onSubmit={createApplication}>
+                  <h3>Create application</h3>
+                  <p className="muted">New applications start pending at Application Review without a route or routing decision.</p>
+                  <div className="create-fields-grid">
+                    {[
+                      ['id', 'Application ID'],
+                      ['institution', 'Institution'],
+                      ['region', 'Region'],
+                      ['officer', 'Assigned officer'],
+                    ].map(([field, label]) => (
+                      <label key={field} htmlFor={`new-application-${field}`}>
+                        {label} *
+                        <input
+                          id={`new-application-${field}`}
+                          value={newApplication[field]}
+                          required
+                          onChange={(event) => setNewApplication((current) => ({
+                            ...current,
+                            [field]: event.target.value,
+                          }))}
+                        />
+                      </label>
+                    ))}
+                    <label htmlFor="new-application-date">
+                      Submission date *
+                      <input
+                        id="new-application-date"
+                        type="date"
+                        value={newApplication.date}
+                        required
+                        onChange={(event) => setNewApplication((current) => ({
+                          ...current,
+                          date: event.target.value,
+                        }))}
+                      />
+                    </label>
+                  </div>
+                  <fieldset className="routing-attributes">
+                    <legend>Optional demo routing attributes</legend>
+                    {[
+                      ['requires_scrutiny', 'Requires scrutiny'],
+                      ['requires_evc', 'Requires EVC'],
+                      ['requires_sac_shc', 'Requires SAC/SHC'],
+                    ].map(([field, label]) => (
+                      <label key={field}>
+                        <input
+                          type="checkbox"
+                          checked={newApplication[field]}
+                          onChange={(event) => setNewApplication((current) => ({
+                            ...current,
+                            [field]: event.target.checked,
+                          }))}
+                        />
+                        {label}
+                      </label>
+                    ))}
+                  </fieldset>
+                  <div className="form-actions">
+                    <button
+                      className="secondary-button"
+                      type="button"
+                      onClick={() => setShowCreateApplication(false)}
+                    >
+                      Cancel
+                    </button>
+                    <button className="primary-button" type="submit" disabled={createBusy}>
+                      {createBusy ? 'Creating...' : 'Create application'}
+                    </button>
+                  </div>
+                </form>
+              )}
               <ApplicationFilters search={search} setSearch={setSearch} filter={filter} setFilter={setFilter} />
               <ApplicationTable rows={filtered} selectedId={selectedId} onSelect={setSelectedId} />
             </>
@@ -607,7 +761,16 @@ function App() {
               <Detail label="Assigned officer" value={selected.officer} />
               <Detail label="Submission date" value={selected.date} />
               <Detail label="Current stage" value={selected.stage} />
+              <Detail label="Assigned route" value={selected.workflow_route} />
             </div>
+
+            {selected.routing_decision && (
+              <div className="reason-box">
+                <strong>Automatic routing decision</strong>
+                <p>{selected.routing_decision.reason}</p>
+                <span>Rule: {selected.routing_decision.rule_id}</span>
+              </div>
+            )}
 
             {selected.reason && (
               <div className="reason-box"><strong>Return reason</strong><p>{selected.reason}</p></div>
@@ -618,18 +781,45 @@ function App() {
               {(() => {
                 const route = workflows[selected.workflow_route] || FALLBACK_STAGES
                 const currentIndex = route.indexOf(selected.stage)
+                const nextStage = currentIndex >= 0 ? route[currentIndex + 1] : null
 
-                return route.map((stage, index) => (
-                  <div className={`workflow-step ${index <= currentIndex ? 'step-done' : ''}`} key={stage}>
-                    <div className="step-marker">{index < currentIndex ? '✓' : index + 1}</div>
-                    <div>
-                      <strong>{stage}</strong>
-                      <span>{index < currentIndex ? 'Completed' : index === currentIndex ? 'Current stage' : 'Upcoming'}</span>
-                    </div>
-                  </div>
-                ))
+                return (
+                  <>
+                    {route.map((stage, index) => (
+                      <div className={`workflow-step ${index <= currentIndex ? 'step-done' : ''}`} key={stage}>
+                        <div className="step-marker">{index < currentIndex ? '✓' : index + 1}</div>
+                        <div>
+                          <strong>{stage}</strong>
+                          <span>{index < currentIndex ? 'Completed' : index === currentIndex ? 'Current stage' : 'Upcoming'}</span>
+                        </div>
+                      </div>
+                    ))}
+                    <p className="muted">
+                      {selected.status === 'Returned'
+                        ? 'Action required: resubmit corrections before continuing.'
+                        : nextStage
+                          ? `Next allowed stage: ${nextStage}`
+                          : 'No further stages.'}
+                    </p>
+                  </>
+                )
               })()}
             </div>
+
+            {canEditWorkflow && (
+                <div className="panel" style={{ marginTop: 16 }}>
+                  <h3>Automatic workflow routing</h3>
+                  <p className="muted">Uses configurable demo rules. Validate them against official AICTE/APH guidance before use.</p>
+                  <button
+                    className="secondary-button"
+                    disabled={busy || !canAssignWorkflow}
+                    onClick={() => performAction('auto-route')}
+                  >
+                    Auto-assign route
+                  </button>
+                  {!canAssignWorkflow && <p className="muted">{routingUnavailableReason}</p>}
+                </div>
+              )}
 
             {canEditWorkflow && (
               <div className="panel" style={{ marginTop: 16 }}>
@@ -638,7 +828,7 @@ function App() {
                 <select
                   id="workflow-route"
                   value={selected.workflow_route || 'STANDARD'}
-                  disabled={busy || selected.stage === 'Completed' || selected.status === 'Approved'}
+                  disabled={busy || !canAssignWorkflow}
                   onChange={(event) => changeWorkflow(event.target.value)}
                 >
                   {Object.keys(workflows).map((route) => <option key={route} value={route}>{route}</option>)}
@@ -709,7 +899,19 @@ function App() {
               </div>
             )}
 
-            {canProcess && !showReturn && (
+            {canProcess && !showReturn && selected.status === 'Returned' && (
+              <div className="detail-actions">
+                <button
+                  className="primary-button"
+                  disabled={busy}
+                  onClick={() => performAction('resubmit')}
+                >
+                  {busy ? 'Processing...' : 'Resubmit corrections'}
+                </button>
+              </div>
+            )}
+
+            {canProcess && !showReturn && selected.status !== 'Returned' && (
               <div className="detail-actions">
                 <button
                   className="secondary-button"

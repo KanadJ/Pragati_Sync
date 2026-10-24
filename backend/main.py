@@ -28,6 +28,7 @@ app.add_middleware(
 )
 
 DATABASE_PATH = Path(__file__).resolve().parent / "aicte.db"
+ROUTING_RULES_PATH = Path(__file__).resolve().parent / "routing_rules.json"
 
 WORKFLOW_ROUTES = {
     "STANDARD": [
@@ -301,6 +302,88 @@ def get_application_route(application):
     return stages
 
 
+def choose_workflow_route(application):
+    try:
+        with ROUTING_RULES_PATH.open(encoding="utf-8") as rules_file:
+            config = json.load(rules_file)
+    except (OSError, json.JSONDecodeError) as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Could not load workflow routing rules: {error}",
+        ) from error
+
+    if not isinstance(config, dict) or not isinstance(config.get("rules"), list):
+        raise HTTPException(status_code=500, detail="Invalid workflow routing rules configuration")
+
+    attributes = {
+        key: application.get(key)
+        for key in ("requires_scrutiny", "requires_evc", "requires_sac_shc")
+        if key in application
+    }
+    for rule in config["rules"]:
+        conditions = rule.get("when")
+        route_id = rule.get("route")
+        if (
+            not isinstance(conditions, dict)
+            or route_id not in WORKFLOW_ROUTES
+            or any(not isinstance(value, bool) for value in conditions.values())
+        ):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Invalid workflow routing rule: {rule.get('id', 'unknown')}",
+            )
+        if all(application.get(key) is value for key, value in conditions.items()):
+            return {
+                "route": route_id,
+                "rule_id": rule.get("id", "unnamed"),
+                "reason": rule.get("reason", "Configured rule matched."),
+                "attributes": attributes,
+            }
+
+    default = config.get("default", {})
+    route_id = default.get("route")
+    if route_id not in WORKFLOW_ROUTES:
+        raise HTTPException(status_code=500, detail="Invalid default workflow routing rule")
+    return {
+        "route": route_id,
+        "rule_id": default.get("id", "default"),
+        "reason": default.get("reason", "Default routing rule applied."),
+        "attributes": attributes,
+    }
+
+
+def ensure_workflow_not_started(application):
+    route_id = application.get("workflow_route")
+    stages = WORKFLOW_ROUTES.get(route_id)
+    if route_id and (
+        not stages or application.get("stage") != stages[0]
+    ):
+        raise HTTPException(
+            status_code=409,
+            detail="The workflow route cannot be changed after the application has left its initial stage.",
+        )
+    history = application.get("history", [])
+    non_creation_history = [
+        event for event in history
+        if event.get("action") != "Application created"
+    ]
+    if application.get("status") != "Pending" or non_creation_history:
+        raise HTTPException(
+            status_code=409,
+            detail="The workflow route can only be assigned before processing begins.",
+        )
+    with connect_db() as connection:
+        events = connection.execute(
+            "SELECT action FROM audit_events WHERE application_id = ?",
+            (application["id"],),
+        ).fetchall()
+    if any(event["action"] != "Application created" for event in events):
+        raise HTTPException(
+            status_code=409,
+            detail="The workflow route cannot be changed after audit history exists.",
+        )
+
+
 def is_completed(application):
     return (
         application.get("stage") == "Completed"
@@ -384,6 +467,103 @@ def logout(
 @app.get("/api/applications")
 def get_applications(user=Depends(get_current_user)):
     return get_all_applications()
+
+
+@app.post("/api/applications", status_code=201)
+def create_application(
+    payload: dict = Body(...),
+    user=Depends(require_roles("Admin")),
+):
+    required_fields = {"id", "institution", "region", "officer", "date"}
+    optional_fields = {
+        "requires_scrutiny", "requires_evc", "requires_sac_shc",
+    }
+    supplied_fields = set(payload)
+    if not required_fields.issubset(supplied_fields):
+        missing = sorted(required_fields - supplied_fields)
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required application fields: {', '.join(missing)}",
+        )
+    unknown_fields = supplied_fields - required_fields - optional_fields
+    if unknown_fields:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unsupported application fields: {', '.join(sorted(unknown_fields))}",
+        )
+
+    for field in required_fields:
+        value = payload[field]
+        if not isinstance(value, str) or not value.strip():
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field} must be a non-empty string",
+            )
+
+    submission_date = parse_date(payload["date"])
+    if submission_date is None or payload["date"] != submission_date.isoformat():
+        raise HTTPException(
+            status_code=400,
+            detail="date must be a valid YYYY-MM-DD date",
+        )
+
+    for field in optional_fields:
+        if field in payload and not isinstance(payload[field], bool):
+            raise HTTPException(
+                status_code=400,
+                detail=f"{field} must be a boolean",
+            )
+
+    application_id = payload["id"].strip()
+    application = {
+        "id": application_id,
+        "institution": payload["institution"].strip(),
+        "region": payload["region"].strip(),
+        "officer": payload["officer"].strip(),
+        "date": payload["date"],
+        "stage": "Application Review",
+        "workflow_route": None,
+        "status": "Pending",
+        "reason": None,
+        "history": [],
+        **{
+            field: payload[field]
+            for field in optional_fields
+            if field in payload
+        },
+    }
+    event = make_history_event(
+        "Application created",
+        application["stage"],
+        "Application created; workflow route not yet assigned.",
+        user["username"],
+    )
+    application["history"].append(event)
+
+    try:
+        with connect_db() as connection:
+            connection.execute(
+                "INSERT INTO applications (id, data) VALUES (?, ?)",
+                (application_id, json.dumps(application)),
+            )
+            connection.execute("""
+                INSERT INTO audit_events
+                    (application_id, action, stage, details, timestamp, actor)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (
+                application_id, event["action"], event["stage"],
+                event["details"], event["timestamp"], event["actor"],
+            ))
+    except sqlite3.IntegrityError as error:
+        raise HTTPException(
+            status_code=409,
+            detail="An application with this ID already exists",
+        ) from error
+
+    return {
+        "message": "Application created successfully",
+        "application": application,
+    }
 
 
 @app.get("/api/workflows")
@@ -564,27 +744,50 @@ def assign_workflow(
 
     if route_id not in WORKFLOW_ROUTES:
         raise HTTPException(status_code=400, detail="Invalid workflow_route")
-    if is_completed(application):
-        raise HTTPException(status_code=400, detail="Cannot change workflow of a completed application")
+    ensure_workflow_not_started(application)
 
-    new_stages = WORKFLOW_ROUTES[route_id]
-    if application.get("stage") not in new_stages:
-        raise HTTPException(
-            status_code=400,
-            detail="Current stage is not part of the selected route",
-        )
-
-    old_route = application.get("workflow_route", "STANDARD")
+    old_route = application.get("workflow_route", "UNASSIGNED")
     if old_route != route_id:
         application["workflow_route"] = route_id
+        application["stage"] = WORKFLOW_ROUTES[route_id][0]
         record_event(
             application, "Workflow changed", application["stage"],
-            f"{old_route} -> {route_id}", user["username"],
+            f"{old_route} -> {route_id}; route manually assigned before processing",
+            user["username"],
         )
 
     return {
         "message": "Workflow route assigned successfully",
         "application": find_application(application_id),
+    }
+
+
+@app.post("/api/applications/{application_id}/auto-route")
+def auto_route_application(
+    application_id: str,
+    user=Depends(require_roles("Admin")),
+):
+    application = find_application(application_id)
+    ensure_workflow_not_started(application)
+    decision = choose_workflow_route(application)
+    application["workflow_route"] = decision["route"]
+    application["stage"] = WORKFLOW_ROUTES[decision["route"]][0]
+    application["routing_decision"] = {
+        **decision,
+        "timestamp": now_iso(),
+        "actor": user["username"],
+    }
+    record_event(
+        application,
+        "Workflow automatically assigned",
+        application["stage"],
+        json.dumps(decision, sort_keys=True),
+        user["username"],
+    )
+    return {
+        "message": "Workflow automatically assigned",
+        "application": find_application(application_id),
+        "routing_decision": application["routing_decision"],
     }
 
 
@@ -599,17 +802,17 @@ def advance_application(
 
     if is_completed(application):
         raise HTTPException(status_code=400, detail="Application is already completed")
+    if application.get("status") == "Returned":
+        raise HTTPException(
+            status_code=409,
+            detail="Resubmit the application for corrections before advancing its workflow.",
+        )
 
     next_stage = stages[stages.index(current_stage) + 1]
-    was_returned = application.get("status") == "Returned"
-    previous_reason = application.get("reason")
 
     application["stage"] = next_stage
     application["reason"] = None
     application["status"] = "Approved" if next_stage == "Completed" else "Under Review"
-
-    if was_returned:
-        record_event(application, "Return resolved", current_stage, previous_reason, user["username"])
 
     record_event(
         application, "Stage advanced", next_stage,
@@ -617,6 +820,33 @@ def advance_application(
     )
     return {
         "message": "Application stage advanced successfully",
+        "application": find_application(application_id),
+    }
+
+
+@app.post("/api/applications/{application_id}/resubmit")
+def resubmit_application(
+    application_id: str,
+    user=Depends(require_roles("Admin", "Officer")),
+):
+    application = find_application(application_id)
+    if application.get("status") != "Returned":
+        raise HTTPException(
+            status_code=409,
+            detail="Only a returned application can be resubmitted.",
+        )
+    reason = application.get("reason")
+    application["status"] = "Under Review"
+    application["reason"] = None
+    record_event(
+        application,
+        "Application resubmitted",
+        application["stage"],
+        f"Corrections resubmitted; prior return reason: {reason}",
+        user["username"],
+    )
+    return {
+        "message": "Application resubmitted; workflow may continue from the current stage.",
         "application": find_application(application_id),
     }
 

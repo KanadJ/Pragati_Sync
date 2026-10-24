@@ -85,6 +85,15 @@ tbody tr:hover, tbody tr.selected-row { background: #f7faff; }
 .open-button:hover, .close-button:hover { background: #edf2f8; }
 footer { display: flex; justify-content: space-between; gap: 12px; color: #8994a3; font-size: 10px; margin-top: 28px; }
 .panel { background: #fff; border: 1px solid #e3e8ef; border-radius: 8px; padding: 24px; }
+.create-application-form { margin-bottom: 18px; }
+.create-application-form h3 { font-size: 15px; margin-bottom: 7px; }
+.create-fields-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
+.create-fields-grid label { display: grid; gap: 6px; color: #526176; font-size: 11px; font-weight: 650; }
+.create-fields-grid input { min-width: 0; width: 100%; padding: 10px; border: 1px solid #d8dfe8; border-radius: 5px; font-size: 12px; }
+.routing-attributes { display: flex; flex-wrap: wrap; gap: 12px 20px; border: 1px solid #e3e8ef; border-radius: 6px; padding: 12px; margin: 0 0 16px; }
+.routing-attributes legend { color: #526176; font-size: 11px; font-weight: 650; padding: 0 5px; }
+.routing-attributes label { display: inline-flex; align-items: center; gap: 7px; color: #526176; font-size: 11px; }
+.routing-attributes input { margin: 0; }
 .muted { color: #7b8798; font-size: 12px; }
 .stage-row { margin-top: 24px; }
 .stage-row > div:first-child { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 9px; }
@@ -152,6 +161,7 @@ footer { display: flex; justify-content: space-between; gap: 12px; color: #8994a
   .stat-value { font-size: 25px; }
   .filters { flex-direction: column; }
   .filters select { height: 40px; }
+  .create-fields-grid { grid-template-columns: 1fr; }
   footer { flex-direction: column; }
   .detail-panel { padding: 20px; }
 }

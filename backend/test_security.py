@@ -144,7 +144,7 @@ class RoleBasedAccessTests(unittest.TestCase):
             403,
         )
 
-    def test_admin_can_manage_workflow(self):
+    def test_admin_cannot_change_workflow_after_processing_starts(self):
         application = main.find_application("AICTE-2026-1001")
         application["stage"] = "Scrutiny"
         application["workflow_route"] = "SCRUTINY_EVC"
@@ -157,11 +157,7 @@ class RoleBasedAccessTests(unittest.TestCase):
             json={"workflow_route": "SCRUTINY_EVC_SAC_SHC"},
         )
 
-        self.assertEqual(response.status_code, 200)
-        self.assertEqual(
-            response.json()["application"]["workflow_route"],
-            "SCRUTINY_EVC_SAC_SHC",
-        )
+        self.assertEqual(response.status_code, 409)
 
     def test_logout_requires_a_valid_session(self):
         self.assertEqual(self.client.post("/api/auth/logout").status_code, 401)
