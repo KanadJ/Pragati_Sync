@@ -1,5 +1,7 @@
 
-from copy import deepcopy
+import json
+import sqlite3
+from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
@@ -11,7 +13,7 @@ app = FastAPI(
         "Backend API for approval workflow "
         "and institutional compliance monitoring."
     ),
-    version="0.2.0",
+    version="0.3.0",
 )
 
 app.add_middleware(
@@ -25,9 +27,11 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Prototype workflow configuration.
-# Confirm the applicable APH rules before using routes
-# as official AICTE approval procedures.
+# Store the database beside this Python file.
+DATABASE_PATH = Path(__file__).resolve().parent / "aicte.db"
+
+# Prototype configuration. Verify official APH rules before
+# treating these routes as authoritative AICTE procedures.
 WORKFLOW_ROUTES = {
     "STANDARD": [
         "Application Review",
@@ -57,18 +61,8 @@ WORKFLOW_ROUTES = {
     ],
 }
 
-
-def make_history_event(action, stage, details=None):
-    """Create a consistent audit-history event."""
-    event = {
-        "action": action,
-        "stage": stage,
-        "details": details,
-    }
-    return event
-
-
-applications = [
+# Seed data is inserted only when the database is first initialized.
+INITIAL_APPLICATIONS = [
     {
         "id": "AICTE-2026-1001",
         "institution": "Western Institute of Technology",
@@ -144,20 +138,91 @@ applications = [
 ]
 
 
-def find_application(application_id):
-    """Find an application or raise a 404 error."""
-    for application in applications:
-        if application["id"] == application_id:
-            return application
+def connect_db():
+    connection = sqlite3.connect(DATABASE_PATH, timeout=10)
+    connection.row_factory = sqlite3.Row
+    return connection
 
-    raise HTTPException(
-        status_code=404,
-        detail="Application not found",
-    )
+
+def initialize_database():
+    """Create the table and seed data only when it is empty."""
+    with connect_db() as connection:
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS applications (
+                id TEXT PRIMARY KEY,
+                data TEXT NOT NULL
+            )
+            """
+        )
+
+        count = connection.execute(
+            "SELECT COUNT(*) FROM applications"
+        ).fetchone()[0]
+
+        if count == 0:
+            connection.executemany(
+                "INSERT INTO applications (id, data) VALUES (?, ?)",
+                [
+                    (
+                        application["id"],
+                        json.dumps(application),
+                    )
+                    for application in INITIAL_APPLICATIONS
+                ],
+            )
+
+
+def get_all_applications():
+    with connect_db() as connection:
+        rows = connection.execute(
+            "SELECT data FROM applications ORDER BY id"
+        ).fetchall()
+
+    return [json.loads(row["data"]) for row in rows]
+
+
+def find_application(application_id):
+    with connect_db() as connection:
+        row = connection.execute(
+            "SELECT data FROM applications WHERE id = ?",
+            (application_id,),
+        ).fetchone()
+
+    if row is None:
+        raise HTTPException(
+            status_code=404,
+            detail="Application not found",
+        )
+
+    return json.loads(row["data"])
+
+
+def save_application(application):
+    """Persist the complete application, including its history."""
+    with connect_db() as connection:
+        connection.execute(
+            """
+            INSERT INTO applications (id, data)
+            VALUES (?, ?)
+            ON CONFLICT(id) DO UPDATE SET data = excluded.data
+            """,
+            (
+                application["id"],
+                json.dumps(application),
+            ),
+        )
+
+
+def make_history_event(action, stage, details=None):
+    return {
+        "action": action,
+        "stage": stage,
+        "details": details,
+    }
 
 
 def get_application_route(application):
-    """Return the configured route for an application."""
     route_id = application.get("workflow_route", "STANDARD")
     stages = WORKFLOW_ROUTES.get(route_id)
 
@@ -179,6 +244,11 @@ def get_application_route(application):
     return stages
 
 
+@app.on_event("startup")
+def startup_event():
+    initialize_database()
+
+
 @app.get("/")
 def home():
     return {
@@ -194,20 +264,16 @@ def health_check():
 
 @app.get("/api/applications")
 def get_applications():
-    return applications
+    return get_all_applications()
 
 
 @app.get("/api/workflows")
 def get_workflows():
-    """List the configured prototype workflow routes."""
-    return {
-        "workflows": WORKFLOW_ROUTES,
-    }
+    return {"workflows": WORKFLOW_ROUTES}
 
 
 @app.post("/api/applications/{application_id}/workflow")
 def assign_workflow(application_id: str, payload: dict = Body(...)):
-    """Assign a route without silently changing the current stage."""
     application = find_application(application_id)
     route_id = payload.get("workflow_route", "")
 
@@ -228,8 +294,6 @@ def assign_workflow(application_id: str, payload: dict = Body(...)):
 
     new_stages = WORKFLOW_ROUTES[route_id]
 
-    # Only allow assignment when the current stage exists in
-    # the selected route. This prevents accidental stage resets.
     if application["stage"] not in new_stages:
         raise HTTPException(
             status_code=400,
@@ -250,6 +314,7 @@ def assign_workflow(application_id: str, payload: dict = Body(...)):
                 f"{old_route} -> {route_id}",
             )
         )
+        save_application(application)
 
     return {
         "message": "Workflow route assigned successfully",
@@ -269,7 +334,6 @@ def advance_application(application_id: str):
 
     stages = get_application_route(application)
     current_stage = application["stage"]
-    current_index = stages.index(current_stage)
 
     if current_stage == "Completed":
         raise HTTPException(
@@ -277,6 +341,7 @@ def advance_application(application_id: str):
             detail="Application is already completed",
         )
 
+    current_index = stages.index(current_stage)
     next_stage = stages[current_index + 1]
 
     was_returned = application["status"] == "Returned"
@@ -285,10 +350,9 @@ def advance_application(application_id: str):
     application["stage"] = next_stage
     application["reason"] = None
 
-    if next_stage == "Completed":
-        application["status"] = "Approved"
-    else:
-        application["status"] = "Under Review"
+    application["status"] = (
+        "Approved" if next_stage == "Completed" else "Under Review"
+    )
 
     if was_returned:
         application["history"].append(
@@ -307,6 +371,8 @@ def advance_application(application_id: str):
         )
     )
 
+    save_application(application)
+
     return {
         "message": "Application stage advanced successfully",
         "application": application,
@@ -324,6 +390,7 @@ def return_application(application_id: str, payload: dict = Body(...)):
     application = find_application(application_id)
 
     reason = payload.get("reason", "")
+
     if not isinstance(reason, str) or not reason.strip():
         raise HTTPException(
             status_code=400,
@@ -357,7 +424,10 @@ def return_application(application_id: str, payload: dict = Body(...)):
         )
     )
 
+    save_application(application)
+
     return {
         "message": "Application returned successfully",
         "application": application,
     }
+
