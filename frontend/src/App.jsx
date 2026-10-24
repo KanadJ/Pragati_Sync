@@ -462,7 +462,7 @@ function App() {
     if (!canProcess) return
     try {
       await request(`/api/notifications/${notificationId}/read`, { method: 'POST' })
-      await refreshData()
+      setNotifications((current) => current.filter((item) => item.id !== notificationId))
     } catch (error) {
       setNotice(error.message)
     }
@@ -886,7 +886,7 @@ function App() {
                         setPage('Applications')
                       }}>Open application</button>
                       {!item.is_read && canProcess && (
-                        <button className="secondary-button" onClick={() => markNotificationRead(item.id)}>Mark read</button>
+                        <button className="secondary-button" onClick={() => markNotificationRead(item.id)}>Mark as viewed</button>
                       )}
                     </div>
                   </div>

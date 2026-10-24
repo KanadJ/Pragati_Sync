@@ -269,6 +269,14 @@ def initialize_database():
             CREATE INDEX IF NOT EXISTS idx_notifications_created
             ON notifications(created_at DESC)
         """)
+        connection.execute("""
+            CREATE TABLE IF NOT EXISTS notification_views (
+                notification_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                viewed_at TEXT NOT NULL,
+                PRIMARY KEY (notification_id, username)
+            )
+        """)
         # Safe schema migration for existing databases.
         columns = {
             row["name"]
@@ -590,6 +598,10 @@ def notification_event(application_id, category, message, dedupe_key, actor):
                         escalation_level = 0, resolved_at = NULL
                     WHERE id = ?
                 """, (message, created_at, existing["id"]))
+                connection.execute(
+                    "DELETE FROM notification_views WHERE notification_id = ?",
+                    (existing["id"],),
+                )
                 created = True
 
     if created:
@@ -1183,15 +1195,16 @@ def get_notifications(
     user=Depends(get_current_user),
 ):
     query = """
-        SELECT id, application_id, category, message, created_at, is_read,
-               escalation_level, resolved_at
-        FROM notifications
+        SELECT n.id, n.application_id, n.category, n.message, n.created_at,
+               0 AS is_read, n.escalation_level, n.resolved_at
+        FROM notifications AS n
+        LEFT JOIN notification_views AS nv
+            ON nv.notification_id = n.id AND nv.username = ?
+        WHERE nv.notification_id IS NULL
     """
-    if unread_only:
-        query += " WHERE is_read = 0"
     query += " ORDER BY created_at DESC, id DESC LIMIT 500"
     with connect_db() as connection:
-        rows = connection.execute(query).fetchall()
+        rows = connection.execute(query, (user["username"],)).fetchall()
     return {"notifications": [dict(row) for row in rows]}
 
 
@@ -1207,12 +1220,13 @@ def mark_notification_read(
         ).fetchone()
         if notification is None:
             raise HTTPException(status_code=404, detail="Notification not found")
-        if not notification["is_read"]:
-            connection.execute(
-                "UPDATE notifications SET is_read = 1 WHERE id = ?",
-                (notification_id,),
-            )
-    if not notification["is_read"]:
+        cursor = connection.execute("""
+            INSERT OR IGNORE INTO notification_views
+                (notification_id, username, viewed_at)
+            VALUES (?, ?, ?)
+        """, (notification_id, user["username"], now_iso()))
+        newly_viewed = cursor.rowcount == 1
+    if newly_viewed:
         application = find_application(notification["application_id"])
         record_event(
             application,
@@ -1223,7 +1237,7 @@ def mark_notification_read(
         )
     with connect_db() as connection:
         updated = dict(connection.execute(
-            "SELECT id, application_id, category, message, created_at, is_read, escalation_level, resolved_at FROM notifications WHERE id = ?",
+            "SELECT id, application_id, category, message, created_at, 1 AS is_read, escalation_level, resolved_at FROM notifications WHERE id = ?",
             (notification_id,),
         ).fetchone())
     return {"notification": updated}
