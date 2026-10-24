@@ -19,6 +19,18 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+WORKFLOW_ROUTES = {
+    "SCRUTINY_ONLY": ["Scrutiny", "Completed"],
+    "SCRUTINY_EVC": ["Scrutiny", "EVC", "Completed"],
+    "EVC_SAC_SHC": ["EVC", "SAC/SHC", "Completed"],
+    "SCRUTINY_EVC_SAC_SHC": [
+        "Scrutiny",
+        "EVC",
+        "SAC/SHC",
+        "Completed",
+    ],
+}
+
 applications = [
     {
         "id": "AICTE-2026-1001",
