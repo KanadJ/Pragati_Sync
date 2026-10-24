@@ -1,11 +1,17 @@
 
+from copy import deepcopy
+
 from fastapi import FastAPI, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
 
+
 app = FastAPI(
     title="AICTE Approval & Compliance System",
-    description="Backend API for approval workflow and institutional compliance monitoring.",
-    version="0.1.0",
+    description=(
+        "Backend API for approval workflow "
+        "and institutional compliance monitoring."
+    ),
+    version="0.2.0",
 )
 
 app.add_middleware(
@@ -19,10 +25,30 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Prototype workflow configuration.
+# Confirm the applicable APH rules before using routes
+# as official AICTE approval procedures.
 WORKFLOW_ROUTES = {
-    "SCRUTINY_ONLY": ["Scrutiny", "Completed"],
-    "SCRUTINY_EVC": ["Scrutiny", "EVC", "Completed"],
-    "EVC_SAC_SHC": ["EVC", "SAC/SHC", "Completed"],
+    "STANDARD": [
+        "Application Review",
+        "Document Verification",
+        "Final Approval",
+        "Completed",
+    ],
+    "SCRUTINY_ONLY": [
+        "Scrutiny",
+        "Completed",
+    ],
+    "SCRUTINY_EVC": [
+        "Scrutiny",
+        "EVC",
+        "Completed",
+    ],
+    "EVC_SAC_SHC": [
+        "EVC",
+        "SAC/SHC",
+        "Completed",
+    ],
     "SCRUTINY_EVC_SAC_SHC": [
         "Scrutiny",
         "EVC",
@@ -31,12 +57,24 @@ WORKFLOW_ROUTES = {
     ],
 }
 
+
+def make_history_event(action, stage, details=None):
+    """Create a consistent audit-history event."""
+    event = {
+        "action": action,
+        "stage": stage,
+        "details": details,
+    }
+    return event
+
+
 applications = [
     {
         "id": "AICTE-2026-1001",
         "institution": "Western Institute of Technology",
         "region": "West",
         "stage": "Document Verification",
+        "workflow_route": "STANDARD",
         "officer": "A. Sharma",
         "date": "2026-10-20",
         "status": "Under Review",
@@ -48,6 +86,7 @@ applications = [
         "institution": "National College of Engineering",
         "region": "South",
         "stage": "Final Approval",
+        "workflow_route": "STANDARD",
         "officer": "R. Kumar",
         "date": "2026-10-18",
         "status": "Pending",
@@ -59,6 +98,7 @@ applications = [
         "institution": "Central Technical Institute",
         "region": "North",
         "stage": "Application Review",
+        "workflow_route": "STANDARD",
         "officer": "S. Patel",
         "date": "2026-10-17",
         "status": "Returned",
@@ -70,6 +110,7 @@ applications = [
         "institution": "Eastern School of Technology",
         "region": "East",
         "stage": "Completed",
+        "workflow_route": "STANDARD",
         "officer": "A. Sharma",
         "date": "2026-10-15",
         "status": "Approved",
@@ -81,6 +122,7 @@ applications = [
         "institution": "City Institute of Computing",
         "region": "West",
         "stage": "Application Review",
+        "workflow_route": "STANDARD",
         "officer": "R. Kumar",
         "date": "2026-10-22",
         "status": "Pending",
@@ -92,6 +134,7 @@ applications = [
         "institution": "Greenfield Polytechnic",
         "region": "South",
         "stage": "Document Verification",
+        "workflow_route": "STANDARD",
         "officer": "S. Patel",
         "date": "2026-10-23",
         "status": "Under Review",
@@ -99,6 +142,41 @@ applications = [
         "history": [],
     },
 ]
+
+
+def find_application(application_id):
+    """Find an application or raise a 404 error."""
+    for application in applications:
+        if application["id"] == application_id:
+            return application
+
+    raise HTTPException(
+        status_code=404,
+        detail="Application not found",
+    )
+
+
+def get_application_route(application):
+    """Return the configured route for an application."""
+    route_id = application.get("workflow_route", "STANDARD")
+    stages = WORKFLOW_ROUTES.get(route_id)
+
+    if stages is None:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown workflow route: {route_id}",
+        )
+
+    if application["stage"] not in stages:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Stage '{application['stage']}' is not part "
+                f"of workflow route '{route_id}'"
+            ),
+        )
+
+    return stages
 
 
 @app.get("/")
@@ -118,50 +196,122 @@ def health_check():
 def get_applications():
     return applications
 
+
+@app.get("/api/workflows")
+def get_workflows():
+    """List the configured prototype workflow routes."""
+    return {
+        "workflows": WORKFLOW_ROUTES,
+    }
+
+
+@app.post("/api/applications/{application_id}/workflow")
+def assign_workflow(application_id: str, payload: dict = Body(...)):
+    """Assign a route without silently changing the current stage."""
+    application = find_application(application_id)
+    route_id = payload.get("workflow_route", "")
+
+    if route_id not in WORKFLOW_ROUTES:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid workflow_route",
+        )
+
+    if (
+        application["stage"] == "Completed"
+        or application["status"] == "Approved"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot change the workflow of a completed application",
+        )
+
+    new_stages = WORKFLOW_ROUTES[route_id]
+
+    # Only allow assignment when the current stage exists in
+    # the selected route. This prevents accidental stage resets.
+    if application["stage"] not in new_stages:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The current stage is not part of the selected route. "
+                "A controlled workflow migration is required."
+            ),
+        )
+
+    old_route = application.get("workflow_route", "STANDARD")
+
+    if old_route != route_id:
+        application["workflow_route"] = route_id
+        application["history"].append(
+            make_history_event(
+                "Workflow changed",
+                application["stage"],
+                f"{old_route} -> {route_id}",
+            )
+        )
+
+    return {
+        "message": "Workflow route assigned successfully",
+        "application": application,
+    }
+
+
 @app.post(
     "/api/applications/{application_id}/advance",
     responses={
-        400: {"description": "Application is already completed"},
+        400: {"description": "Invalid workflow transition"},
         404: {"description": "Application not found"},
     },
 )
 def advance_application(application_id: str):
-    for application in applications:
-        if application["id"] == application_id:
-            stages = [
-                "Application Review",
-                "Document Verification",
-                "Final Approval",
-                "Completed",
-            ]
+    application = find_application(application_id)
 
-            current_stage = application["stage"]
+    stages = get_application_route(application)
+    current_stage = application["stage"]
+    current_index = stages.index(current_stage)
 
-            if current_stage == "Completed":
-                raise HTTPException(
-                    status_code=400,
-                    detail="Application is already completed",
-                )
+    if current_stage == "Completed":
+        raise HTTPException(
+            status_code=400,
+            detail="Application is already completed",
+        )
 
-            current_index = stages.index(current_stage)
-            next_stage = stages[current_index + 1]
+    next_stage = stages[current_index + 1]
 
-            application["stage"] = next_stage
+    was_returned = application["status"] == "Returned"
+    previous_reason = application.get("reason")
 
-            if next_stage == "Completed":
-                application["status"] = "Approved"
-            else:
-                application["status"] = "Under Review"
+    application["stage"] = next_stage
+    application["reason"] = None
 
-            return {
-                "message": "Application stage advanced successfully",
-                "application": application,
-            }
+    if next_stage == "Completed":
+        application["status"] = "Approved"
+    else:
+        application["status"] = "Under Review"
 
-    raise HTTPException(
-        status_code=404,
-        detail="Application not found",
+    if was_returned:
+        application["history"].append(
+            make_history_event(
+                "Return resolved",
+                current_stage,
+                previous_reason,
+            )
+        )
+
+    application["history"].append(
+        make_history_event(
+            "Stage advanced",
+            next_stage,
+            f"Previous stage: {current_stage}",
+        )
     )
+
+    return {
+        "message": "Application stage advanced successfully",
+        "application": application,
+    }
+
 
 @app.post(
     "/api/applications/{application_id}/return",
@@ -171,31 +321,43 @@ def advance_application(application_id: str):
     },
 )
 def return_application(application_id: str, payload: dict = Body(...)):
-    reason = payload.get("reason", "").strip()
+    application = find_application(application_id)
 
-    if not reason:
+    reason = payload.get("reason", "")
+    if not isinstance(reason, str) or not reason.strip():
         raise HTTPException(
             status_code=400,
             detail="A reason is required to return an application",
         )
 
-    for application in applications:
-        if application["id"] == application_id:
-            if application["stage"] == "Completed" or application["status"] == "Approved":
-                raise HTTPException(
-                    status_code=400,
-                    detail="An approved application cannot be returned",
-                )
+    if (
+        application["stage"] == "Completed"
+        or application["status"] == "Approved"
+    ):
+        raise HTTPException(
+            status_code=400,
+            detail="An approved application cannot be returned",
+        )
 
-            application["status"] = "Returned"
-            application["reason"] = reason
+    if application["status"] == "Returned":
+        raise HTTPException(
+            status_code=400,
+            detail="Application has already been returned",
+        )
 
-            return {
-                "message": "Application returned successfully",
-                "application": application,
-            }
+    reason = reason.strip()
+    application["status"] = "Returned"
+    application["reason"] = reason
 
-    raise HTTPException(
-        status_code=404,
-        detail="Application not found",
+    application["history"].append(
+        make_history_event(
+            "Application returned",
+            application["stage"],
+            reason,
+        )
     )
+
+    return {
+        "message": "Application returned successfully",
+        "application": application,
+    }
