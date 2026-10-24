@@ -28,6 +28,9 @@ function App() {
   const [auditEvents, setAuditEvents] = useState([])
   const [monitoring, setMonitoring] = useState(null)
   const [notifications, setNotifications] = useState([])
+  const [trackedDocuments, setTrackedDocuments] = useState([])
+  const [expiryWarningDays, setExpiryWarningDays] = useState(30)
+  const [renewalDrafts, setRenewalDrafts] = useState({})
   const [documents, setDocuments] = useState([])
   const [complianceSummary, setComplianceSummary] = useState(null)
   const [documentEdits, setDocumentEdits] = useState({})
@@ -100,13 +103,14 @@ function App() {
   }, [token])
 
   const refreshData = useCallback(async () => {
-    const [apps, workflowData, auditData, monitoringData, notificationData, dashboardResult] =
+    const [apps, workflowData, auditData, monitoringData, notificationData, trackingData, dashboardResult] =
       await Promise.all([
         request('/api/applications'),
         request('/api/workflows'),
         request('/api/audit'),
         request('/api/monitoring'),
         request('/api/notifications'),
+        request('/api/documents'),
         request('/api/dashboard')
           .then((data) => ({ data, error: '' }))
           .catch((error) => ({ data: null, error: error.message })),
@@ -117,6 +121,8 @@ function App() {
     setAuditEvents(auditData.events || [])
     setMonitoring(monitoringData)
     setNotifications(notificationData.notifications || [])
+    setTrackedDocuments(trackingData.documents || [])
+    setExpiryWarningDays(trackingData.expiry_warning_days)
     setDashboardData(dashboardResult.data)
     setDashboardError(dashboardResult.error)
 
@@ -230,6 +236,7 @@ function App() {
     setAuditEvents([])
     setMonitoring(null)
     setNotifications([])
+    setTrackedDocuments([])
     setDocuments([])
     setComplianceSummary(null)
     setSelectedId('')
@@ -257,6 +264,7 @@ function App() {
         document_type: document.document_type,
         name: document.name,
         status: document.status,
+        issue_date: document.issue_date || '',
         expiry_date: document.expiry_date || '',
         reviewer_remarks: document.reviewer_remarks || '',
       },
@@ -278,6 +286,7 @@ function App() {
             document_type: document.document_type,
             name: document.name,
             status: document.status,
+            issue_date: document.issue_date || '',
             expiry_date: document.expiry_date || '',
             reviewer_remarks: document.reviewer_remarks || '',
           },
@@ -458,6 +467,57 @@ function App() {
     }
   }
 
+  async function submitRenewal(document) {
+    if (!canProcess || busy) return
+    const draft = renewalDrafts[document.id] || {}
+    setBusy(true)
+    setNotice('')
+    try {
+      await request(
+        `/api/applications/${encodeURIComponent(document.application_id)}/documents/${document.id}/renewal`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            issue_date: draft.issue_date || null,
+            expiry_date: draft.expiry_date || null,
+            remarks: draft.remarks || null,
+          }),
+        }
+      )
+      await refreshData()
+      setNotice('Renewal submitted for verification.')
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  async function verifyRenewal(document, decision) {
+    if (!canProcess || busy) return
+    const draft = renewalDrafts[document.id] || {}
+    setBusy(true)
+    setNotice('')
+    try {
+      await request(
+        `/api/applications/${encodeURIComponent(document.application_id)}/documents/${document.id}/renewal/verify`,
+        {
+          method: 'POST',
+          body: JSON.stringify({
+            decision,
+            remarks: draft.verifyRemarks || null,
+          }),
+        }
+      )
+      await refreshData()
+      setNotice(`Renewal ${decision.toLowerCase()}.`)
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setBusy(false)
+    }
+  }
+
   async function markNotificationRead(notificationId) {
     if (!canProcess) return
     try {
@@ -623,6 +683,7 @@ function App() {
         {[
           ['Dashboard', '▦'],
           ['Applications', '▤'],
+          ['Document Tracking', '▧'],
           ['Monitoring', '◷'],
           ['Notifications', '♢'],
           ['Audit Trail', '≡'],
@@ -895,6 +956,107 @@ function App() {
             </div>
           )}
 
+          {page === 'Document Tracking' && (
+            <div className="panel">
+              <div className="section-heading">
+                <div>
+                  <h2>Document expiry and renewal tracking</h2>
+                  <p>Expiry warnings use the configured {expiryWarningDays}-day window; it is a configurable demo setting, not an official AICTE deadline.</p>
+                </div>
+                <span className="record-count">{trackedDocuments.length} document(s)</span>
+              </div>
+              {trackedDocuments.length === 0 ? (
+                <div className="empty-state">No institution documents are recorded yet.</div>
+              ) : (
+                <div className="table-wrap">
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>APPLICATION / INSTITUTION</th>
+                        <th>DOCUMENT</th>
+                        <th>DATES</th>
+                        <th>TRACKING STATUS</th>
+                        <th>RENEWAL ACTION</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {trackedDocuments.map((document) => {
+                        const draft = renewalDrafts[document.id] || {}
+                        return (
+                          <tr key={document.id}>
+                            <td>
+                              <button className="application-link" onClick={() => {
+                                setSelectedId(document.application_id)
+                                setPage('Applications')
+                              }}>{document.application_id}</button>
+                              <div className="institution-name">{document.institution}</div>
+                            </td>
+                            <td>{document.document_type}<div className="institution-name">{document.name}</div></td>
+                            <td>
+                              <div>Issued: {document.issue_date || '—'}</div>
+                              <div>Expires: {document.expiry_date || 'Not set'}</div>
+                              <div>Submitted: {document.submission_date || '—'}</div>
+                              {document.renewal_status === 'Submitted' && (
+                                <>
+                                  <div>Renewal issue: {document.renewal_issue_date || '—'}</div>
+                                  <div>Renewal expiry: {document.renewal_expiry_date || '—'}</div>
+                                  <div>Renewal remarks: {document.renewal_remarks || '—'}</div>
+                                </>
+                              )}
+                            </td>
+                            <td>
+                              <strong>{document.tracking_status}</strong>
+                              <div className="institution-name">Verification: {document.verification_status || document.status}</div>
+                              <div className="institution-name">Renewal: {document.renewal_status}</div>
+                            </td>
+                            <td className="renewal-actions">
+                              {canProcess && document.renewal_status !== 'Submitted' && (
+                                <div className="renewal-form">
+                                  <label>Renewed issue date
+                                    <input type="date" value={draft.issue_date || ''} disabled={busy} onChange={(event) => setRenewalDrafts((current) => ({
+                                      ...current,
+                                      [document.id]: { ...current[document.id], issue_date: event.target.value },
+                                    }))} />
+                                  </label>
+                                  <label>Renewed expiry date
+                                    <input type="date" value={draft.expiry_date || ''} disabled={busy} onChange={(event) => setRenewalDrafts((current) => ({
+                                      ...current,
+                                      [document.id]: { ...current[document.id], expiry_date: event.target.value },
+                                    }))} />
+                                  </label>
+                                  <label>Submission remarks
+                                    <textarea rows={2} value={draft.remarks || ''} disabled={busy} onChange={(event) => setRenewalDrafts((current) => ({
+                                      ...current,
+                                      [document.id]: { ...current[document.id], remarks: event.target.value },
+                                    }))} />
+                                  </label>
+                                  <button className="secondary-button" disabled={busy || !draft.expiry_date} onClick={() => submitRenewal(document)}>Submit renewal</button>
+                                </div>
+                              )}
+                              {canProcess && document.renewal_status === 'Submitted' && (
+                                <div className="renewal-form">
+                                  <label>Verifier remarks
+                                    <textarea rows={2} value={draft.verifyRemarks || ''} disabled={busy} onChange={(event) => setRenewalDrafts((current) => ({
+                                      ...current,
+                                      [document.id]: { ...current[document.id], verifyRemarks: event.target.value },
+                                    }))} />
+                                  </label>
+                                  <button className="primary-button" disabled={busy} onClick={() => verifyRenewal(document, 'Approved')}>Approve</button>
+                                  <button className="danger-button" disabled={busy || !draft.verifyRemarks?.trim()} onClick={() => verifyRenewal(document, 'Rejected')}>Reject with reason</button>
+                                </div>
+                              )}
+                              {!canProcess && <span className="institution-name">Read-only</span>}
+                            </td>
+                          </tr>
+                        )
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </div>
+          )}
+
           {page === 'Audit Trail' && (
             <div className="panel">
               <div className="section-heading">
@@ -1065,6 +1227,7 @@ function App() {
                 return (
                   <div className="document-row" key={document.id}>
                     <span>Created {new Date(document.created_at).toLocaleDateString()}</span>
+                    <span>Tracking: {document.tracking_status || '—'} · Renewal: {document.renewal_status || 'Not Required'}</span>
                     <label>Document type
                       <input
                         value={edit.document_type ?? document.document_type}
@@ -1072,6 +1235,17 @@ function App() {
                         onChange={(event) => setDocumentEdits((current) => ({
                           ...current,
                           [document.id]: { ...current[document.id], document_type: event.target.value },
+                        }))}
+                      />
+                    </label>
+                    <label>Issue date
+                      <input
+                        type="date"
+                        value={edit.issue_date ?? document.issue_date ?? ''}
+                        disabled={!canProcess || busy}
+                        onChange={(event) => setDocumentEdits((current) => ({
+                          ...current,
+                          [document.id]: { ...current[document.id], issue_date: event.target.value },
                         }))}
                       />
                     </label>
@@ -1129,6 +1303,7 @@ function App() {
                   <h4>Add document</h4>
                   <label>Document type<input value={documentDraft.document_type} required onChange={(event) => setDocumentDraft((draft) => ({ ...draft, document_type: event.target.value }))} /></label>
                   <label>Name<input value={documentDraft.name} required onChange={(event) => setDocumentDraft((draft) => ({ ...draft, name: event.target.value }))} /></label>
+                  <label>Issue date<input type="date" value={documentDraft.issue_date || ''} onChange={(event) => setDocumentDraft((draft) => ({ ...draft, issue_date: event.target.value }))} /></label>
                   <label>Expiry date<input type="date" value={documentDraft.expiry_date} onChange={(event) => setDocumentDraft((draft) => ({ ...draft, expiry_date: event.target.value }))} /></label>
                   <button className="primary-button" type="submit" disabled={busy}>Add as pending</button>
                   <p className="muted">Submission does not mean verification. Rejection requires reviewer remarks.</p>

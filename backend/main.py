@@ -6,7 +6,7 @@ import os
 import secrets
 import sqlite3
 from contextlib import contextmanager
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from urllib.parse import urlsplit
@@ -243,7 +243,13 @@ def initialize_database():
                     status IN ('Pending', 'Submitted', 'Verified', 'Rejected')
                 ),
                 expiry_date TEXT,
+                issue_date TEXT,
+                submission_date TEXT,
                 reviewer_remarks TEXT,
+                renewal_status TEXT NOT NULL DEFAULT 'Not Required',
+                renewal_issue_date TEXT,
+                renewal_expiry_date TEXT,
+                renewal_remarks TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             )
@@ -288,6 +294,25 @@ def initialize_database():
             connection.execute(
                 "ALTER TABLE audit_events ADD COLUMN actor TEXT"
             )
+
+        document_columns = {
+            row["name"]
+            for row in connection.execute(
+                "PRAGMA table_info(documents)"
+            ).fetchall()
+        }
+        for name, definition in (
+            ("issue_date", "TEXT"),
+            ("submission_date", "TEXT"),
+            ("renewal_status", "TEXT NOT NULL DEFAULT 'Not Required'"),
+            ("renewal_issue_date", "TEXT"),
+            ("renewal_expiry_date", "TEXT"),
+            ("renewal_remarks", "TEXT"),
+        ):
+            if name not in document_columns:
+                connection.execute(
+                    f"ALTER TABLE documents ADD COLUMN {name} {definition}"
+                )
 
         count = connection.execute(
             "SELECT COUNT(*) FROM applications"
@@ -376,6 +401,37 @@ def list_application_documents(application_id):
     return [dict(row) for row in rows]
 
 
+def get_document_tracking_status(document, settings, today=None):
+    today = today or date.today()
+    renewal_status = document.get("renewal_status", "Not Required")
+    if renewal_status == "Submitted":
+        return "Submitted for Renewal"
+    if document["status"] == "Submitted":
+        return "Awaiting Verification"
+    if document["status"] == "Rejected":
+        return "Awaiting Renewal"
+    if document["status"] != "Verified":
+        return "Awaiting Verification"
+
+    expiry = parse_date(document.get("expiry_date"))
+    if expiry and expiry < today:
+        return "Expired"
+    if expiry and (expiry - today).days <= settings["expiry_warning_days"]:
+        return "Expiring Soon"
+    if renewal_status in {"Awaiting Renewal", "Rejected"}:
+        return "Awaiting Renewal"
+    return "Valid"
+
+
+def get_document_verification_status(document):
+    if (
+        document.get("renewal_status") == "Submitted"
+        or document["status"] in {"Pending", "Submitted"}
+    ):
+        return "Awaiting Verification"
+    return document["status"]
+
+
 def calculate_compliance_summary(documents, settings, today=None):
     today = today or date.today()
     present_types = {
@@ -390,6 +446,12 @@ def calculate_compliance_summary(documents, settings, today=None):
 
     if not documents or missing_types:
         state = "Missing"
+    elif any(
+        document.get("renewal_status") == "Submitted"
+        or document["status"] == "Submitted"
+        for document in documents
+    ):
+        state = "Pending Verification"
     elif any(document["status"] == "Rejected" for document in documents):
         state = "Rejected"
     elif any(
@@ -631,6 +693,30 @@ def run_compliance_check(as_of=None, actor="System"):
             document_id = document["id"]
             status = document["status"]
             expiry = parse_date(document.get("expiry_date"))
+            renewal_submitted = document.get("renewal_status") == "Submitted"
+            renewal_status = document.get("renewal_status", "Not Required")
+            if (
+                status == "Verified"
+                and expiry
+                and expiry <= as_of + timedelta(days=settings["expiry_warning_days"])
+                and renewal_status in {"Not Required", "Approved"}
+            ):
+                with connect_db() as connection:
+                    connection.execute(
+                        "UPDATE documents SET renewal_status = 'Awaiting Renewal', updated_at = ? WHERE id = ?",
+                        (now_iso(), document_id),
+                    )
+                document["renewal_status"] = "Awaiting Renewal"
+                renewal_status = "Awaiting Renewal"
+                record_event(
+                    application,
+                    "Document renewal required",
+                    application.get("stage"),
+                    f"Document {document_id} is within its configured expiry warning period.",
+                    actor,
+                )
+            if renewal_submitted:
+                continue
             if status == "Rejected":
                 key = f"document_rejected:{document_id}:{document['updated_at']}"
                 message = (
@@ -1022,6 +1108,9 @@ def get_documents(
     find_application(application_id)
     documents = list_application_documents(application_id)
     settings = get_compliance_settings()
+    for document in documents:
+        document["tracking_status"] = get_document_tracking_status(document, settings)
+        document["verification_status"] = get_document_verification_status(document)
     summary = calculate_compliance_summary(documents, settings)
     return {
         "application_id": application_id,
@@ -1038,7 +1127,8 @@ def create_document(
 ):
     application = find_application(application_id)
     allowed = {
-        "document_type", "name", "status", "expiry_date", "reviewer_remarks",
+        "document_type", "name", "status", "issue_date", "submission_date",
+        "expiry_date", "reviewer_remarks",
     }
     if set(payload) - allowed:
         raise HTTPException(status_code=400, detail="Unsupported document fields")
@@ -1057,13 +1147,16 @@ def create_document(
             status_code=400,
             detail=f"status must be one of: {', '.join(sorted(DOCUMENT_STATUSES))}",
         )
-    expiry = payload.get("expiry_date")
-    if expiry is not None and (
-        not isinstance(expiry, str)
-        or parse_date(expiry) is None
-        or parse_date(expiry).isoformat() != expiry
-    ):
-        raise HTTPException(status_code=400, detail="expiry_date must be a valid YYYY-MM-DD date or null")
+    dates = {}
+    for field in ("issue_date", "submission_date", "expiry_date"):
+        value = payload.get(field)
+        if value is not None and (
+            not isinstance(value, str)
+            or parse_date(value) is None
+            or parse_date(value).isoformat() != value
+        ):
+            raise HTTPException(status_code=400, detail=f"{field} must be a valid YYYY-MM-DD date or null")
+        dates[field] = value
     remarks = payload.get("reviewer_remarks")
     if remarks is not None and not isinstance(remarks, str):
         raise HTTPException(status_code=400, detail="reviewer_remarks must be a string or null")
@@ -1074,12 +1167,13 @@ def create_document(
     with connect_db() as connection:
         cursor = connection.execute("""
             INSERT INTO documents
-                (application_id, document_type, name, status, expiry_date,
-                 reviewer_remarks, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                (application_id, document_type, name, status, issue_date,
+                 submission_date, expiry_date, reviewer_remarks, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """, (
             application_id, payload["document_type"].strip(), payload["name"].strip(),
-            status, expiry, remarks.strip() if remarks else None,
+            status, dates["issue_date"], dates["submission_date"], dates["expiry_date"],
+            remarks.strip() if remarks else None,
             timestamp, timestamp,
         ))
         document_id = cursor.lastrowid
@@ -1097,6 +1191,8 @@ def create_document(
             "SELECT * FROM documents WHERE id = ?",
             (document_id,),
         ).fetchone())
+    document["tracking_status"] = get_document_tracking_status(document, get_compliance_settings())
+    document["verification_status"] = get_document_verification_status(document)
     return {"document": document}
 
 
@@ -1109,7 +1205,8 @@ def update_document(
 ):
     application = find_application(application_id)
     allowed = {
-        "document_type", "name", "status", "expiry_date", "reviewer_remarks",
+        "document_type", "name", "status", "issue_date", "expiry_date",
+        "reviewer_remarks",
     }
     if not payload or set(payload) - allowed:
         raise HTTPException(status_code=400, detail="Provide valid document fields to update")
@@ -1136,15 +1233,16 @@ def update_document(
                 detail=f"status must be one of: {', '.join(sorted(DOCUMENT_STATUSES))}",
             )
         updates["status"] = payload["status"]
-    if "expiry_date" in payload:
-        expiry = payload["expiry_date"]
-        if expiry is not None and (
-            not isinstance(expiry, str)
-            or parse_date(expiry) is None
-            or parse_date(expiry).isoformat() != expiry
-        ):
-            raise HTTPException(status_code=400, detail="expiry_date must be a valid YYYY-MM-DD date or null")
-        updates["expiry_date"] = expiry
+    for field in ("issue_date", "expiry_date"):
+        if field in payload:
+            value = payload[field]
+            if value is not None and (
+                not isinstance(value, str)
+                or parse_date(value) is None
+                or parse_date(value).isoformat() != value
+            ):
+                raise HTTPException(status_code=400, detail=f"{field} must be a valid YYYY-MM-DD date or null")
+            updates[field] = value
     if "reviewer_remarks" in payload:
         remarks = payload["reviewer_remarks"]
         if remarks is not None and not isinstance(remarks, str):
@@ -1176,6 +1274,162 @@ def update_document(
             "SELECT * FROM documents WHERE id = ?",
             (document_id,),
         ).fetchone())
+    updated["tracking_status"] = get_document_tracking_status(updated, get_compliance_settings())
+    updated["verification_status"] = get_document_verification_status(updated)
+    return {"document": updated}
+
+
+@app.get("/api/documents")
+def get_document_tracking(user=Depends(get_current_user)):
+    settings = get_compliance_settings()
+    with connect_db() as connection:
+        rows = connection.execute("""
+            SELECT d.*, a.data AS application_data
+            FROM documents AS d
+            JOIN applications AS a ON a.id = d.application_id
+            ORDER BY d.expiry_date IS NULL, d.expiry_date, d.id
+        """).fetchall()
+
+    documents = []
+    for row in rows:
+        document = dict(row)
+        application = json.loads(document.pop("application_data"))
+        document["institution"] = application.get("institution", "")
+        document["tracking_status"] = get_document_tracking_status(document, settings)
+        document["verification_status"] = get_document_verification_status(document)
+        documents.append(document)
+    return {"documents": documents, "expiry_warning_days": settings["expiry_warning_days"]}
+
+
+@app.post("/api/applications/{application_id}/documents/{document_id}/renewal")
+def submit_document_renewal(
+    application_id: str,
+    document_id: int,
+    payload: dict = Body(...),
+    user=Depends(require_roles("Admin", "Officer")),
+):
+    application = find_application(application_id)
+    allowed = {"issue_date", "expiry_date", "remarks"}
+    if set(payload) - allowed or "expiry_date" not in payload:
+        raise HTTPException(
+            status_code=400,
+            detail="Provide expiry_date and optional issue_date and remarks",
+        )
+    dates = {}
+    for field in ("issue_date", "expiry_date"):
+        value = payload.get(field)
+        if field == "expiry_date" and value is None:
+            raise HTTPException(status_code=400, detail="expiry_date is required")
+        if value is not None and (
+            not isinstance(value, str)
+            or parse_date(value) is None
+            or parse_date(value).isoformat() != value
+        ):
+            raise HTTPException(status_code=400, detail=f"{field} must be a valid YYYY-MM-DD date or null")
+        dates[field] = value
+    remarks = payload.get("remarks")
+    if remarks is not None and not isinstance(remarks, str):
+        raise HTTPException(status_code=400, detail="remarks must be a string or null")
+
+    with connect_db() as connection:
+        document = connection.execute(
+            "SELECT * FROM documents WHERE id = ? AND application_id = ?",
+            (document_id, application_id),
+        ).fetchone()
+        if document is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+        if document["renewal_status"] == "Submitted":
+            raise HTTPException(status_code=409, detail="A renewal is already awaiting verification")
+        connection.execute("""
+            UPDATE documents
+            SET renewal_status = 'Submitted', renewal_issue_date = ?,
+                renewal_expiry_date = ?, submission_date = ?, renewal_remarks = ?,
+                updated_at = ?
+            WHERE id = ? AND application_id = ?
+        """, (
+            dates["issue_date"], dates["expiry_date"], date.today().isoformat(),
+            remarks.strip() if remarks else None, now_iso(), document_id, application_id,
+        ))
+
+    record_event(
+        application,
+        "Document renewal submitted",
+        application.get("stage"),
+        f"Document {document_id} renewal submitted with expiry {dates['expiry_date']}.",
+        user["username"],
+    )
+    run_compliance_check(actor=user["username"])
+    with connect_db() as connection:
+        updated = dict(connection.execute(
+            "SELECT * FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone())
+    updated["tracking_status"] = get_document_tracking_status(updated, get_compliance_settings())
+    updated["verification_status"] = get_document_verification_status(updated)
+    return {"document": updated}
+
+
+@app.post("/api/applications/{application_id}/documents/{document_id}/renewal/verify")
+def verify_document_renewal(
+    application_id: str,
+    document_id: int,
+    payload: dict = Body(...),
+    user=Depends(require_roles("Admin", "Officer")),
+):
+    application = find_application(application_id)
+    if set(payload) - {"decision", "remarks"}:
+        raise HTTPException(status_code=400, detail="Unsupported renewal verification fields")
+    decision = payload.get("decision")
+    if not isinstance(decision, str) or decision not in {"Approved", "Rejected"}:
+        raise HTTPException(status_code=400, detail="decision must be Approved or Rejected")
+    remarks = payload.get("remarks")
+    if remarks is not None and not isinstance(remarks, str):
+        raise HTTPException(status_code=400, detail="remarks must be a string or null")
+    remarks = remarks.strip() if remarks else None
+    if decision == "Rejected" and not remarks:
+        raise HTTPException(status_code=400, detail="Rejection remarks are required")
+
+    with connect_db() as connection:
+        document = connection.execute(
+            "SELECT * FROM documents WHERE id = ? AND application_id = ?",
+            (document_id, application_id),
+        ).fetchone()
+        if document is None:
+            raise HTTPException(status_code=404, detail="Document not found")
+        if document["renewal_status"] != "Submitted":
+            raise HTTPException(status_code=409, detail="No renewal is awaiting verification")
+        if decision == "Approved":
+            connection.execute("""
+                UPDATE documents
+                SET issue_date = COALESCE(renewal_issue_date, issue_date),
+                    expiry_date = renewal_expiry_date,
+                    status = 'Verified', renewal_status = 'Approved',
+                    reviewer_remarks = ?, updated_at = ?
+                WHERE id = ? AND application_id = ?
+            """, (remarks, now_iso(), document_id, application_id))
+        else:
+            connection.execute("""
+                UPDATE documents
+                SET renewal_status = 'Awaiting Renewal', reviewer_remarks = ?,
+                    updated_at = ?
+                WHERE id = ? AND application_id = ?
+            """, (remarks, now_iso(), document_id, application_id))
+
+    record_event(
+        application,
+        f"Document renewal {decision.lower()}",
+        application.get("stage"),
+        f"Document {document_id} renewal {decision.lower()}."
+        + (f" Remarks: {remarks}" if remarks else ""),
+        user["username"],
+    )
+    run_compliance_check(actor=user["username"])
+    with connect_db() as connection:
+        updated = dict(connection.execute(
+            "SELECT * FROM documents WHERE id = ?",
+            (document_id,),
+        ).fetchone())
+    updated["tracking_status"] = get_document_tracking_status(updated, get_compliance_settings())
     return {"document": updated}
 
 

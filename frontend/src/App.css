@@ -112,6 +112,11 @@ footer { display: flex; justify-content: space-between; gap: 12px; color: #8994a
 .notification-row { align-items: flex-start; }
 .notification-read { opacity: .72; }
 .notification-row .form-actions { margin-top: 10px; }
+.renewal-actions { min-width: 260px; white-space: normal; }
+.renewal-form { display: grid; gap: 8px; min-width: 220px; }
+.renewal-form label { display: grid; gap: 4px; color: #526176; font-size: 10px; font-weight: 650; }
+.renewal-form input, .renewal-form textarea { width: 100%; min-width: 0; padding: 7px; border: 1px solid #d8dfe8; border-radius: 5px; color: #344358; background: #fff; font-size: 11px; }
+.renewal-form button { width: 100%; }
 .muted { color: #7b8798; font-size: 12px; }
 .stage-row { margin-top: 24px; }
 .stage-row > div:first-child { display: flex; justify-content: space-between; font-size: 12px; margin-bottom: 9px; }

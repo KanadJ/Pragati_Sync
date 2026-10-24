@@ -169,6 +169,243 @@ class DocumentComplianceTests(unittest.TestCase):
         self.assertEqual(state("Verified", (today + timedelta(days=10)).isoformat()), "Expiring Soon")
         self.assertEqual(state("Verified"), "Compliant")
 
+    def test_document_tracking_statuses_use_configured_expiry_window(self):
+        settings = main.get_compliance_settings()
+        settings["expiry_warning_days"] = 5
+        today = date.today()
+
+        def tracking(status, expiry=None, renewal_status="Not Required"):
+            return main.get_document_tracking_status(
+                {
+                    "status": status,
+                    "expiry_date": expiry,
+                    "renewal_status": renewal_status,
+                },
+                settings,
+                today,
+            )
+
+        self.assertEqual(
+            tracking("Verified", (today + timedelta(days=5)).isoformat()),
+            "Expiring Soon",
+        )
+        self.assertEqual(
+            tracking("Verified", (today + timedelta(days=6)).isoformat()),
+            "Valid",
+        )
+        self.assertEqual(
+            tracking("Verified", (today - timedelta(days=1)).isoformat()),
+            "Expired",
+        )
+        self.assertEqual(tracking("Pending"), "Awaiting Verification")
+        self.assertEqual(
+            tracking("Verified", renewal_status="Submitted"),
+            "Submitted for Renewal",
+        )
+        self.assertEqual(
+            tracking("Verified", renewal_status="Rejected"),
+            "Awaiting Renewal",
+        )
+        self.assertEqual(
+            tracking("Verified", renewal_status="Awaiting Renewal"),
+            "Awaiting Renewal",
+        )
+
+    def test_expiry_notifications_use_warning_setting_and_deduplicate(self):
+        settings = json.loads(main.COMPLIANCE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        settings["expiry_warning_days"] = 5
+        main.COMPLIANCE_SETTINGS_PATH.write_text(json.dumps(settings), encoding="utf-8")
+        officer = self.login("officer")
+        self.assertEqual(
+            self.create_document(
+                officer,
+                status="Verified",
+                expiry_date=(date.today() + timedelta(days=5)).isoformat(),
+            ).status_code,
+            201,
+        )
+        self.assertEqual(
+            self.create_document(
+                officer,
+                status="Verified",
+                expiry_date=(date.today() - timedelta(days=1)).isoformat(),
+            ).status_code,
+            201,
+        )
+
+        admin = self.login("admin")
+        checked = self.client.post("/api/compliance/check", headers=admin)
+        self.assertEqual(checked.status_code, 200)
+        self.assertEqual(checked.json()["created"], 0)
+        with main.connect_db() as connection:
+            categories = [
+                row["category"]
+                for row in connection.execute(
+                    "SELECT category FROM notifications ORDER BY id"
+                ).fetchall()
+            ]
+        self.assertCountEqual(categories, ["document_expiring", "document_expired"])
+
+    def test_existing_documents_receive_safe_additive_renewal_migration(self):
+        legacy_database = Path(self.database_directory.name) / "legacy.db"
+        main.DATABASE_PATH = legacy_database
+        connection = main.sqlite3.connect(legacy_database)
+        try:
+            connection.execute("""
+                CREATE TABLE documents (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    application_id TEXT NOT NULL,
+                    document_type TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    expiry_date TEXT,
+                    reviewer_remarks TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                )
+            """)
+            connection.execute("""
+                INSERT INTO documents
+                    (application_id, document_type, name, status, created_at, updated_at)
+                VALUES ('COMPLIANCE-1', 'Lease', 'Legacy lease', 'Verified', '2025-01-01', '2025-01-01')
+            """)
+            connection.commit()
+        finally:
+            connection.close()
+
+        main.initialize_database()
+        with main.connect_db() as connection:
+            columns = {
+                row["name"]
+                for row in connection.execute("PRAGMA table_info(documents)").fetchall()
+            }
+            document = connection.execute(
+                "SELECT name, status FROM documents WHERE id = 1"
+            ).fetchone()
+        self.assertTrue({
+            "issue_date", "submission_date", "renewal_status",
+            "renewal_issue_date", "renewal_expiry_date", "renewal_remarks",
+        }.issubset(columns))
+        self.assertEqual(document["name"], "Legacy lease")
+        self.assertEqual(document["status"], "Verified")
+        main.DATABASE_PATH = Path(self.database_directory.name) / "test.db"
+
+    def test_renewal_submission_approval_and_audit_history(self):
+        officer = self.login("officer")
+        created = self.create_document(
+            officer,
+            status="Verified",
+            expiry_date=(date.today() - timedelta(days=1)).isoformat(),
+        )
+        self.assertEqual(created.status_code, 201)
+        document_id = created.json()["document"]["id"]
+        proposed_expiry = (date.today() + timedelta(days=365)).isoformat()
+        submitted = self.client.post(
+            f"/api/applications/COMPLIANCE-1/documents/{document_id}/renewal",
+            headers=officer,
+            json={
+                "issue_date": date.today().isoformat(),
+                "expiry_date": proposed_expiry,
+                "remarks": "Renewal documents submitted.",
+            },
+        )
+        self.assertEqual(submitted.status_code, 200)
+        pending = submitted.json()["document"]
+        self.assertEqual(pending["tracking_status"], "Submitted for Renewal")
+        self.assertEqual(pending["verification_status"], "Awaiting Verification")
+        self.assertEqual(pending["renewal_status"], "Submitted")
+        self.assertEqual(pending["expiry_date"], (date.today() - timedelta(days=1)).isoformat())
+        self.assertIsNotNone(pending["submission_date"])
+        with main.connect_db() as connection:
+            expiry_notice = connection.execute(
+                "SELECT resolved_at FROM notifications WHERE category = 'document_expired'"
+            ).fetchone()
+        self.assertIsNotNone(expiry_notice["resolved_at"])
+
+        approved = self.client.post(
+            f"/api/applications/COMPLIANCE-1/documents/{document_id}/renewal/verify",
+            headers=self.login("admin"),
+            json={"decision": "Approved", "remarks": "Reviewed."},
+        )
+        self.assertEqual(approved.status_code, 200)
+        updated = approved.json()["document"]
+        self.assertEqual(updated["status"], "Verified")
+        self.assertEqual(updated["renewal_status"], "Approved")
+        self.assertEqual(updated["expiry_date"], proposed_expiry)
+        self.assertEqual(updated["tracking_status"], "Valid")
+
+        with main.connect_db() as connection:
+            actions = [
+                (row["action"], row["actor"], row["timestamp"])
+                for row in connection.execute("""
+                    SELECT action, actor, timestamp FROM audit_events
+                    WHERE application_id = 'COMPLIANCE-1'
+                """).fetchall()
+            ]
+        renewal_events = [
+            event for event in actions
+            if event[0] in {"Document renewal submitted", "Document renewal approved"}
+        ]
+        self.assertEqual([event[0] for event in renewal_events], [
+            "Document renewal submitted",
+            "Document renewal approved",
+        ])
+        self.assertEqual([event[1] for event in renewal_events], ["officer", "admin"])
+        self.assertTrue(all(event[2] for event in renewal_events))
+
+    def test_renewal_rejection_requires_reason_and_viewer_cannot_change_status(self):
+        officer = self.login("officer")
+        created = self.create_document(
+            officer,
+            status="Verified",
+            expiry_date=(date.today() - timedelta(days=1)).isoformat(),
+        )
+        document_id = created.json()["document"]["id"]
+        renewal_url = f"/api/applications/COMPLIANCE-1/documents/{document_id}/renewal"
+        self.assertEqual(
+            self.client.post(
+                renewal_url,
+                headers=self.login("viewer"),
+                json={"expiry_date": (date.today() + timedelta(days=365)).isoformat()},
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post(
+                renewal_url,
+                headers=officer,
+                json={"expiry_date": (date.today() + timedelta(days=365)).isoformat()},
+            ).status_code,
+            200,
+        )
+        verify_url = f"{renewal_url}/verify"
+        self.assertEqual(
+            self.client.post(
+                verify_url,
+                headers=self.login("viewer"),
+                json={"decision": "Approved"},
+            ).status_code,
+            403,
+        )
+        self.assertEqual(
+            self.client.post(
+                verify_url,
+                headers=self.login("admin"),
+                json={"decision": "Rejected"},
+            ).status_code,
+            400,
+        )
+        rejected = self.client.post(
+            verify_url,
+            headers=self.login("admin"),
+            json={"decision": "Rejected", "remarks": "Expiry date evidence is incomplete."},
+        )
+        self.assertEqual(rejected.status_code, 200)
+        document = rejected.json()["document"]
+        self.assertEqual(document["renewal_status"], "Awaiting Renewal")
+        self.assertEqual(document["tracking_status"], "Expired")
+        self.assertEqual(document["reviewer_remarks"], "Expiry date evidence is incomplete.")
+
     def test_rejection_notification_is_deduplicated_audited_and_readable_by_officer(self):
         officer = self.login("officer")
         created = self.create_document(

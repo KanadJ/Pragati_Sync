@@ -73,20 +73,35 @@ migrations are required for this feature.
 
 ## Document register and compliance notifications
 
-Application detail panels include a document register. Admins and Officers
-can add or update document type, name, status, expiry date, and reviewer
-remarks; Viewers can read document records and compliance summaries only.
-Supported statuses are `Pending`, `Submitted`, `Verified`, and `Rejected`.
+Application detail panels include a document register, and the Document
+Tracking page lists documents across applications. Admins and Officers can add
+or update document type, name, issue date, verification status, expiry date,
+and reviewer remarks; Viewers can read records and summaries only. Supported
+verification statuses are `Pending`, `Submitted`, `Verified`, and `Rejected`.
 Submission is not verification, and a rejection must include reviewer remarks.
-Document changes and notification creation, resolution, escalation, and
-view-status changes are recorded through the existing audit history.
+No document files or sensitive document contents are stored.
 
 `GET /api/applications/{application_id}/documents` returns the document
 register and its compliance summary. The summary states are `Missing`,
 `Pending Verification`, `Rejected`, `Expiring Soon`, `Expired`, and
 `Compliant`; an empty register or an unverified document is never compliant.
 `GET /api/applications/{application_id}/compliance-summary` returns just the
-summary.
+summary. `GET /api/documents` lists documents across applications with their
+tracking and verification states. Tracking states include `Valid`,
+`Expiring Soon`, `Expired`, `Awaiting Renewal`, `Submitted for Renewal`, and
+`Awaiting Verification`.
+
+Admins and Officers submit renewal metadata (issue date, required expiry date,
+and optional remarks) using
+`POST /api/applications/{application_id}/documents/{document_id}/renewal`.
+The existing expiry remains effective until verification. An Admin or Officer
+can approve or reject a submitted renewal using
+`POST /api/applications/{application_id}/documents/{document_id}/renewal/verify`
+with `{"decision":"Approved"}` or `{"decision":"Rejected","remarks":"..."}`.
+Rejection remarks are required. Approval applies the submitted issue/expiry
+dates and marks the document `Verified`; rejection returns it to `Awaiting
+Renewal`. Submission, verification, and renewal-required transitions are
+recorded in the application audit trail with actor and timestamp.
 
 Warning windows, required document types, and escalation thresholds are
 configured in `backend/compliance_settings.json`. These are **demo settings**,
@@ -114,7 +129,10 @@ deadlines and escalate unresolved notifications, an authorized operator must
 invoke the Admin-only check endpoint periodically, or an external deployment
 job must call it using a valid session. The endpoint is local/in-app only;
 email, SMS, institution-scoped visibility, and an automated schedule are not
-implemented. The `documents`, `notifications`, and per-user
+implemented. Document expiry warning notifications use the configured
+`expiry_warning_days` value and are deduplicated by document and expiry date;
+an in-progress renewal suppresses the old expiry alert until the renewal is
+approved or rejected. The `documents`, `notifications`, and per-user
 `notification_views` tables and their indexes are created idempotently at
 startup; existing application, notification, and audit records are preserved,
 and this feature requires no database reset.
