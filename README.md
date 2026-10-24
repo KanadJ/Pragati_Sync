@@ -71,6 +71,45 @@ Routing metadata is stored inside the existing application JSON record and
 workflow events use the existing audit table. No database schema changes or
 migrations are required for this feature.
 
+## Explainable workflow risk assessment
+
+`GET /api/monitoring` includes a deterministic, rule-based `risk_score`
+(0–100 or `null` when no factor can be assessed), `risk_level`,
+`risk_factors`, `risk_recommendations`, and `risk_data_gaps` for each
+application, plus counts by risk level. This is not machine-learning
+prediction and is not an official AICTE risk determination. It is read-only
+and follows the endpoint's existing authenticated access for Admin, Officer,
+and Viewer roles.
+
+The scoring settings are in `backend/compliance_settings.json` under
+`workflow_risk_assessment`. Default factor caps are deadline 40, current-stage
+age 25, and compliance 35 points; the caps must total 100. An overdue deadline
+starts at 30 points and adds 2 points per overdue day up to 40. Upcoming
+deadline bands score 25 points at 0–3 days, 20 at 4–7, 12 at 8–14, and 5 at
+15–30 days. Current-stage age scores 10 at 7–13 days, 18 at 14–29, and 25 at
+30 or more days. Completed applications do not accrue deadline or stage-age
+risk. Existing custom settings files that omit the new section continue to
+use these validated code defaults.
+
+Compliance scores each document only once using its highest applicable
+signal: expired 25, awaiting renewal or rejected 18, expiring within the
+configured expiry-warning period 10, or awaiting verification 8. Each
+configured required document type without a document record adds 15; the
+whole compliance category is capped at 35. When document-register entries
+exist, the legacy application-level document expiry is not separately scored
+to avoid potentially counting the same document twice.
+
+Risk bands are Low 0–24, Moderate 25–49, High 50–74, and Critical 75–100.
+Invalid or missing deadlines, unavailable stage-entry timestamps, absent
+document expiry dates, and unconfigured required-document types are surfaced
+in `risk_data_gaps`; they are not silently interpreted as positive evidence
+of safety. If no factor can be assessed, the score is `null` and level is
+`Unknown`. Stage duration uses the latest matching stage-entry audit event
+(`Application created`, workflow assignment, or `Stage advanced`); no
+submission date is substituted when that audit evidence is absent. The
+default weights, bands, and point values are demo policy and should be
+reviewed for the intended workflow before operational use.
+
 ## Document register and compliance notifications
 
 Application detail panels include a document register, and the Document

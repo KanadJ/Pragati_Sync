@@ -336,6 +336,12 @@ function App() {
     })
   ).length
 
+  const riskSummary = monitoring?.risk_summary || {}
+  const highestRiskApplications = [...(monitoring?.applications || [])]
+    .filter((item) => item.risk_score !== null && item.risk_score !== undefined)
+    .sort((left, right) => right.risk_score - left.risk_score)
+    .slice(0, 5)
+
   async function performAction(action, reason = '') {
     if (!selected || busy || !canProcess) return
 
@@ -769,6 +775,39 @@ function App() {
                 </div>
               )}
 
+              <div className="panel risk-overview">
+                <div className="section-heading">
+                  <div>
+                    <h2>Explainable workflow risk</h2>
+                    <p>Rule-based assessment from available workflow and compliance data; not machine-learning prediction.</p>
+                  </div>
+                  <span className="record-count">
+                    {Object.entries(riskSummary)
+                      .map(([level, count]) => `${level}: ${count}`)
+                      .join(' · ') || 'Loading risk assessment'}
+                  </span>
+                </div>
+                {highestRiskApplications.length === 0 ? (
+                  <p className="muted">No assessed application risks are available yet. Missing inputs are reported as unknown, not low risk.</p>
+                ) : highestRiskApplications.map((item) => (
+                  <div className="risk-overview-row" key={item.id}>
+                    <span className={`risk-badge risk-${item.risk_level.toLowerCase()}`}>
+                      {item.risk_score} · {item.risk_level}
+                    </span>
+                    <div>
+                      <strong>{item.institution || item.id}</strong>
+                      <p>{item.id} · {(item.risk_factors || []).filter((factor) => factor.points > 0).map((factor) => factor.explanation).join(' ') || 'No elevated factors in available data.'}</p>
+                      {(item.risk_recommendations || []).length > 0 && (
+                        <p>Recommended: {item.risk_recommendations.join(' ')}</p>
+                      )}
+                    </div>
+                    <button className="secondary-button" onClick={() => { setSelectedId(item.id); setPage('Monitoring') }}>
+                      View factors
+                    </button>
+                  </div>
+                ))}
+              </div>
+
               <div className="section-heading">
                 <div><h2>Application register</h2><p>Search, filter and select an application to review.</p></div>
                 <span className="record-count">{filtered.length} records</span>
@@ -880,12 +919,21 @@ function App() {
 
               <div className="panel monitoring-panel">
                 <div className="section-heading">
-                  <div><h2>Compliance monitoring</h2><p>Demo warning and escalation thresholds; validate before operational use.</p></div>
+                  <div><h2>Compliance and risk monitoring</h2><p>Configurable demo thresholds; this is an explainable rule-based assessment, not machine learning or an official AICTE determination.</p></div>
                   {isAdmin && <button className="secondary-button" disabled={busy} onClick={runComplianceCheck}>Run compliance check</button>}
                 </div>
                 <p className="muted">
                   {monitoring ? `Checked on ${monitoring.checked_on}. Set dates in an application's review panel.` : 'Loading compliance data...'}
                 </p>
+                {monitoring && (
+                  <div className="risk-level-summary" aria-label="Risk level counts">
+                    {Object.entries(riskSummary).map(([level, count]) => (
+                      <span className={`risk-badge risk-${level.toLowerCase()}`} key={level}>
+                        {level}: {count}
+                      </span>
+                    ))}
+                  </div>
+                )}
 
                 {(monitoring?.applications || []).map((item) => {
                   const alerts = (item.alerts || []).map((alert) =>
@@ -900,6 +948,20 @@ function App() {
                       <div>
                         <strong>{item.institution}</strong>
                         <p>{item.id} · {item.stage}</p>
+                        <div className="risk-detail">
+                          <span className={`risk-badge risk-${item.risk_level.toLowerCase()}`}>
+                            {item.risk_score === null ? 'Score unavailable' : `Risk ${item.risk_score}/100`} · {item.risk_level}
+                          </span>
+                          {(item.risk_factors || []).map((factor) => (
+                            <p className="risk-factor" key={`${item.id}-${factor.category}-${factor.name}`}>
+                              <strong>{factor.name}: +{factor.points}</strong> — {factor.explanation}
+                              {factor.recommendation && <span> Recommendation: {factor.recommendation}</span>}
+                            </p>
+                          ))}
+                          {(item.risk_data_gaps || []).map((gap) => (
+                            <p className="risk-gap" key={`${item.id}-${gap}`}>Not assessed: {gap}</p>
+                          ))}
+                        </div>
                         <p>Document-register status: <strong>{item.compliance_state || 'Unknown'}</strong> · {item.documents_count || 0} document(s)</p>
                         <span>
                           Deadline: {item.due_date || 'Not set'} · Document expiry: {item.document_expiry_date || 'Not set'}

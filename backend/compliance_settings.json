@@ -2,5 +2,32 @@
   "notice": "DEMO SETTINGS ONLY. Validate document requirements, expiry warning periods, and escalation timelines against current official AICTE requirements before operational use.",
   "expiry_warning_days": 30,
   "required_document_types": [],
-  "escalation_thresholds_days": [3, 7]
+  "escalation_thresholds_days": [3, 7],
+  "workflow_risk_assessment": {
+    "factor_caps": {
+      "deadline": 40,
+      "stage_age": 25,
+      "compliance": 35
+    },
+    "risk_level_thresholds": {
+      "low_max": 24,
+      "moderate_max": 49,
+      "high_max": 74
+    },
+    "deadline": {
+      "overdue_base_points": 30,
+      "overdue_points_per_day": 2,
+      "approaching_bands": [[3, 25], [7, 20], [14, 12], [30, 5]]
+    },
+    "stage_age": {
+      "bands": [[7, 10], [14, 18], [30, 25]]
+    },
+    "compliance": {
+      "missing_required_document_points": 15,
+      "expired_document_points": 25,
+      "awaiting_renewal_points": 18,
+      "expiring_document_points": 10,
+      "awaiting_verification_points": 8
+    }
+  }
 }

@@ -93,6 +93,20 @@ footer { display: flex; justify-content: space-between; gap: 12px; color: #8994a
 .dashboard-summary-row strong { flex: 0 0 auto; color: #174a83; }
 .dashboard-state { margin: -12px 0 30px; font-size: 12px; }
 .dashboard-state p { margin: 7px 0 12px; color: #7b8798; }
+.risk-overview { margin-bottom: 24px; }
+.risk-overview-row { display: grid; grid-template-columns: auto minmax(0, 1fr) auto; align-items: center; gap: 14px; padding: 12px 0; border-top: 1px solid #edf0f4; }
+.risk-overview-row strong { font-size: 12px; }
+.risk-overview-row p { color: #778397; font-size: 11px; line-height: 1.5; margin: 5px 0 0; }
+.risk-badge { display: inline-flex; align-items: center; width: fit-content; padding: 5px 9px; border-radius: 20px; font-size: 10px; font-weight: 700; white-space: nowrap; }
+.risk-low { color: #18754f; background: #e7f6ee; }
+.risk-moderate { color: #95620a; background: #fff5df; }
+.risk-high { color: #a44b13; background: #fff0e2; }
+.risk-critical { color: #a93636; background: #ffeded; }
+.risk-unknown { color: #65758b; background: #edf1f6; }
+.risk-level-summary { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 18px; }
+.risk-detail { margin: 10px 0; padding: 11px; background: #f8fafc; border: 1px solid #e7ecf2; border-radius: 6px; }
+.risk-factor, .risk-gap { font-size: 11px; line-height: 1.5; margin: 8px 0 0; color: #526176; }
+.risk-gap { color: #7b8798; }
 .create-application-form { margin-bottom: 18px; }
 .create-application-form h3 { font-size: 15px; margin-bottom: 7px; }
 .create-fields-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
@@ -166,6 +180,7 @@ footer { display: flex; justify-content: space-between; gap: 12px; color: #8994a
   .topbar { padding: 0 22px; }
   .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
   .dashboard-summary-grid { grid-template-columns: 1fr; }
+  .risk-overview-row { grid-template-columns: 1fr; align-items: start; }
   td, th { padding: 13px 10px; }
 }
 @media (max-width: 700px) {

@@ -81,6 +81,24 @@ NOTIFICATION_CATEGORIES = {
     "application_overdue",
 }
 
+DEFAULT_WORKFLOW_RISK_ASSESSMENT = {
+    "factor_caps": {"deadline": 40, "stage_age": 25, "compliance": 35},
+    "risk_level_thresholds": {"low_max": 24, "moderate_max": 49, "high_max": 74},
+    "deadline": {
+        "overdue_base_points": 30,
+        "overdue_points_per_day": 2,
+        "approaching_bands": [[3, 25], [7, 20], [14, 12], [30, 5]],
+    },
+    "stage_age": {"bands": [[7, 10], [14, 18], [30, 25]]},
+    "compliance": {
+        "missing_required_document_points": 15,
+        "expired_document_points": 25,
+        "awaiting_renewal_points": 18,
+        "expiring_document_points": 10,
+        "awaiting_verification_points": 8,
+    },
+}
+
 WORKFLOW_ROUTES = {
     "STANDARD": [
         "Application Review", "Document Verification",
@@ -389,7 +407,124 @@ def get_compliance_settings():
         or escalation_days != sorted(set(escalation_days))
     ):
         raise HTTPException(status_code=500, detail="Invalid compliance settings configuration")
+    settings["workflow_risk_assessment"] = validate_workflow_risk_assessment(
+        settings.get(
+            "workflow_risk_assessment",
+            DEFAULT_WORKFLOW_RISK_ASSESSMENT,
+        )
+    )
     return settings
+
+
+def validate_workflow_risk_assessment(value):
+    def invalid():
+        raise HTTPException(
+            status_code=500,
+            detail="Invalid workflow risk assessment configuration",
+        )
+
+    if not isinstance(value, dict):
+        invalid()
+    caps = value.get("factor_caps")
+    if not isinstance(caps, dict) or set(caps) != {"deadline", "stage_age", "compliance"}:
+        invalid()
+    if any(
+        not isinstance(points, int) or isinstance(points, bool) or points < 0
+        for points in caps.values()
+    ) or sum(caps.values()) != 100:
+        invalid()
+
+    levels = value.get("risk_level_thresholds")
+    if not isinstance(levels, dict) or set(levels) != {"low_max", "moderate_max", "high_max"}:
+        invalid()
+    level_thresholds = [levels[key] for key in ("low_max", "moderate_max", "high_max")]
+    if any(
+        not isinstance(points, int) or isinstance(points, bool)
+        for points in level_thresholds
+    ) or not (0 <= level_thresholds[0] < level_thresholds[1] < level_thresholds[2] < 100):
+        invalid()
+
+    deadline = value.get("deadline")
+    stage_age = value.get("stage_age")
+    compliance = value.get("compliance")
+    if not all(isinstance(section, dict) for section in (deadline, stage_age, compliance)):
+        invalid()
+
+    overdue_base = deadline.get("overdue_base_points")
+    overdue_daily = deadline.get("overdue_points_per_day")
+    if (
+        not isinstance(overdue_base, int)
+        or isinstance(overdue_base, bool)
+        or not 0 <= overdue_base <= caps["deadline"]
+        or not isinstance(overdue_daily, int)
+        or isinstance(overdue_daily, bool)
+        or overdue_daily < 0
+    ):
+        invalid()
+
+    def valid_bands(bands, cap, increasing_points):
+        if not isinstance(bands, list) or not bands:
+            return False
+        previous_day = 0
+        previous_points = None
+        for band in bands:
+            if (
+                not isinstance(band, list)
+                or len(band) != 2
+                or any(not isinstance(item, int) or isinstance(item, bool) for item in band)
+            ):
+                return False
+            threshold_day, points = band
+            if (
+                threshold_day <= previous_day
+                or points < 0
+                or points > cap
+                or (
+                    previous_points is not None
+                    and (points <= previous_points if increasing_points else points >= previous_points)
+                )
+            ):
+                return False
+            previous_day = threshold_day
+            previous_points = points
+        return True
+
+    if not valid_bands(
+        deadline.get("approaching_bands"),
+        caps["deadline"],
+        increasing_points=False,
+    ):
+        invalid()
+    if not valid_bands(stage_age.get("bands"), caps["stage_age"], increasing_points=True):
+        invalid()
+
+    expected_compliance_settings = {
+        "missing_required_document_points",
+        "expired_document_points",
+        "awaiting_renewal_points",
+        "expiring_document_points",
+        "awaiting_verification_points",
+    }
+    if set(compliance) != expected_compliance_settings or any(
+        not isinstance(points, int)
+        or isinstance(points, bool)
+        or not 0 <= points <= caps["compliance"]
+        for points in compliance.values()
+    ):
+        invalid()
+    return value
+
+
+def get_workflow_risk_level(score, thresholds):
+    if score is None:
+        return "Unknown"
+    if score <= thresholds["low_max"]:
+        return "Low"
+    if score <= thresholds["moderate_max"]:
+        return "Moderate"
+    if score <= thresholds["high_max"]:
+        return "High"
+    return "Critical"
 
 
 def list_application_documents(application_id):
@@ -430,6 +565,283 @@ def get_document_verification_status(document):
     ):
         return "Awaiting Verification"
     return document["status"]
+
+
+def get_stage_entry_timestamps():
+    with connect_db() as connection:
+        rows = connection.execute("""
+            SELECT application_id, stage, action, timestamp
+            FROM audit_events
+            WHERE action IN (
+                'Application created',
+                'Workflow changed',
+                'Workflow automatically assigned',
+                'Stage advanced'
+            )
+            ORDER BY id
+        """).fetchall()
+    timestamps = {}
+    for row in rows:
+        if row["stage"] in (None, ""):
+            continue
+        timestamp = parse_datetime(row["timestamp"])
+        if timestamp is not None:
+            timestamps[(row["application_id"], row["stage"])] = timestamp
+    return timestamps
+
+
+def parse_datetime(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed
+
+
+def calculate_workflow_risk(
+    application,
+    documents,
+    settings,
+    stage_entered_at=None,
+    today=None,
+):
+    today = today or date.today()
+    config = settings["workflow_risk_assessment"]
+    caps = config["factor_caps"]
+    factors = []
+    data_gaps = []
+    recommendations = []
+    assessed = set()
+
+    def add_factor(category, name, points, explanation, recommendation=None):
+        if category == "compliance":
+            already_used = sum(
+                factor["points"]
+                for factor in factors
+                if factor["category"] == "compliance"
+            )
+            uncapped_points = points
+            points = min(points, max(0, caps["compliance"] - already_used))
+            if points < uncapped_points:
+                explanation += " The compliance category cap limits the additional score."
+        factors.append({
+            "category": category,
+            "name": name,
+            "points": points,
+            "explanation": explanation,
+            "recommendation": recommendation,
+        })
+        if recommendation:
+            recommendations.append(recommendation)
+
+    completed = is_completed(application)
+    due_value = application.get("due_date")
+    due = parse_date(due_value)
+    if completed:
+        assessed.add("deadline")
+        add_factor("deadline", "Deadline", 0, "Application is completed; deadline risk is not active.")
+    elif due is not None:
+        assessed.add("deadline")
+        days_remaining = (due - today).days
+        if days_remaining < 0:
+            days_overdue = abs(days_remaining)
+            points = min(
+                caps["deadline"],
+                config["deadline"]["overdue_base_points"]
+                + config["deadline"]["overdue_points_per_day"] * days_overdue,
+            )
+            add_factor(
+                "deadline",
+                "Overdue deadline",
+                points,
+                f"Deadline passed {days_overdue} day(s) ago.",
+                "Review the application immediately and update its due date only if the recorded deadline was incorrect.",
+            )
+        else:
+            band = next(
+                (
+                    band for band in config["deadline"]["approaching_bands"]
+                    if days_remaining <= band[0]
+                ),
+                None,
+            )
+            points = band[1] if band else 0
+            explanation = (
+                f"Deadline is in {days_remaining} day(s)."
+                if points
+                else f"Deadline is in {days_remaining} day(s), outside configured warning bands."
+            )
+            add_factor(
+                "deadline",
+                "Upcoming deadline",
+                points,
+                explanation,
+                "Review outstanding workflow and compliance actions before the deadline." if points else None,
+            )
+    elif due_value not in (None, ""):
+        data_gaps.append("Application deadline is invalid; deadline risk could not be assessed.")
+    else:
+        data_gaps.append("Application deadline is not recorded; deadline risk could not be assessed.")
+
+    if completed:
+        assessed.add("stage_age")
+        add_factor("stage_age", "Current-stage age", 0, "Application is completed; stage-aging risk is not active.")
+    elif stage_entered_at is not None:
+        if isinstance(stage_entered_at, datetime):
+            entered_at = stage_entered_at
+        else:
+            entered_at = parse_datetime(stage_entered_at)
+        if entered_at is None or entered_at.date() > today:
+            data_gaps.append("Current-stage entry timestamp is invalid; stage age could not be assessed.")
+        else:
+            assessed.add("stage_age")
+            days_in_stage = (today - entered_at.date()).days
+            band = next(
+                (
+                    band for band in reversed(config["stage_age"]["bands"])
+                    if days_in_stage >= band[0]
+                ),
+                None,
+            )
+            points = band[1] if band else 0
+            add_factor(
+                "stage_age",
+                "Time in current stage",
+                points,
+                f"Application has been in {application.get('stage') or 'the current stage'} for {days_in_stage} day(s).",
+                "Review the current stage for blockers and determine the next processing action." if points else None,
+            )
+    else:
+        data_gaps.append("No reliable audit timestamp for entry into the current stage; stage age could not be assessed.")
+
+    compliance_config = config["compliance"]
+    required_types = settings["required_document_types"]
+    if documents or required_types:
+        assessed.add("compliance")
+        required_keys = set()
+        document_types = set()
+        for document in documents:
+            document_type = document.get("document_type")
+            if isinstance(document_type, str):
+                document_types.add(document_type.strip().casefold())
+
+            expiry_value = document.get("expiry_date")
+            expiry = parse_date(expiry_value)
+            if expiry_value not in (None, "") and expiry is None:
+                data_gaps.append(
+                    f"Expiry date for {document.get('document_type') or 'a document'} ({document.get('name') or document.get('id', 'unknown')}) is invalid."
+                )
+            elif not expiry:
+                data_gaps.append(
+                    f"Expiry date for {document.get('document_type') or 'a document'} ({document.get('name') or document.get('id', 'unknown')}) is not recorded."
+                )
+
+            renewal_status = document.get("renewal_status", "Not Required")
+            status = document.get("status")
+            if expiry and expiry < today:
+                points = compliance_config["expired_document_points"]
+                explanation = f"{document.get('document_type') or 'Document'} ({document.get('name') or 'unnamed'}) expired on {expiry.isoformat()}."
+                recommendation = "Record and submit a renewal, then complete verification."
+            elif renewal_status in {"Awaiting Renewal", "Rejected"} or status == "Rejected":
+                points = compliance_config["awaiting_renewal_points"]
+                explanation = f"{document.get('document_type') or 'Document'} ({document.get('name') or 'unnamed'}) is awaiting renewal after rejection or an expiry warning."
+                recommendation = "Resolve the renewal issue and submit updated document metadata for verification."
+            elif (
+                expiry
+                and status == "Verified"
+                and 0 <= (expiry - today).days <= settings["expiry_warning_days"]
+            ):
+                points = compliance_config["expiring_document_points"]
+                explanation = f"{document.get('document_type') or 'Document'} ({document.get('name') or 'unnamed'}) expires on {expiry.isoformat()}."
+                recommendation = "Initiate renewal before the recorded expiry date."
+            elif renewal_status == "Submitted" or status in {"Pending", "Submitted"}:
+                points = compliance_config["awaiting_verification_points"]
+                explanation = f"{document.get('document_type') or 'Document'} ({document.get('name') or 'unnamed'}) is awaiting verification."
+                recommendation = "Complete document verification and record the decision."
+            else:
+                points = 0
+                explanation = f"{document.get('document_type') or 'Document'} ({document.get('name') or 'unnamed'}) has no configured outstanding status issue."
+                recommendation = None
+            add_factor(
+                "compliance",
+                f"Document {document.get('id', 'unknown')}",
+                points,
+                explanation,
+                recommendation,
+            )
+
+        for required_type in required_types:
+            required_key = required_type.strip().casefold()
+            if required_key in required_keys:
+                continue
+            required_keys.add(required_key)
+            if required_key not in document_types:
+                add_factor(
+                    "compliance",
+                    f"Missing {required_type}",
+                    compliance_config["missing_required_document_points"],
+                    f"Configured required document type '{required_type}' has no document record.",
+                    f"Record and verify the required {required_type} document.",
+                )
+        if not required_types:
+            data_gaps.append("Required document types are not configured; missing-document risk could not be assessed.")
+        if documents and application.get("document_expiry_date") not in (None, ""):
+            data_gaps.append(
+                "Application-level document expiry is not scored separately when document-register entries exist, to avoid potential double-counting."
+            )
+    else:
+        legacy_expiry_value = application.get("document_expiry_date")
+        legacy_expiry = parse_date(legacy_expiry_value)
+        if legacy_expiry:
+            data_gaps.append("Required document types are not configured; missing-document risk could not be assessed.")
+            assessed.add("compliance")
+            if legacy_expiry < today:
+                points = compliance_config["expired_document_points"]
+                add_factor(
+                    "compliance",
+                    "Application-level document expiry",
+                    points,
+                    f"Application-level compliance document expired on {legacy_expiry.isoformat()}.",
+                    "Record and verify a renewed compliance document.",
+                )
+            elif (legacy_expiry - today).days <= settings["expiry_warning_days"]:
+                points = compliance_config["expiring_document_points"]
+                add_factor(
+                    "compliance",
+                    "Application-level document expiry",
+                    points,
+                    f"Application-level compliance document expires on {legacy_expiry.isoformat()}.",
+                    "Review renewal requirements before the recorded expiry date.",
+                )
+            else:
+                add_factor(
+                    "compliance",
+                    "Application-level document expiry",
+                    0,
+                    "Application-level compliance document is outside the configured warning period.",
+                )
+        else:
+            data_gaps.append("Required document types are not configured; missing-document risk could not be assessed.")
+            if legacy_expiry_value not in (None, ""):
+                data_gaps.append("Application-level document expiry is invalid; compliance expiry risk could not be assessed.")
+            data_gaps.append("No document records or required document types are available for compliance risk assessment.")
+
+    score = sum(factor["points"] for factor in factors)
+    if not assessed:
+        score = None
+    risk_level = get_workflow_risk_level(score, config["risk_level_thresholds"])
+
+    return {
+        "risk_score": score,
+        "risk_level": risk_level,
+        "risk_factors": factors,
+        "risk_recommendations": list(dict.fromkeys(recommendations)),
+        "risk_data_gaps": list(dict.fromkeys(data_gaps)),
+    }
 
 
 def calculate_compliance_summary(documents, settings, today=None):
@@ -1520,6 +1932,7 @@ def compliance_monitoring(user=Depends(get_current_user)):
     today = date.today()
     results = []
     settings = get_compliance_settings()
+    stage_entries = get_stage_entry_timestamps()
 
     for application in get_all_applications():
         due_value = application.get("due_date")
@@ -1568,6 +1981,13 @@ def compliance_monitoring(user=Depends(get_current_user)):
 
         documents = list_application_documents(application["id"])
         summary = calculate_compliance_summary(documents, settings, today)
+        risk = calculate_workflow_risk(
+            application,
+            documents,
+            settings,
+            stage_entries.get((application["id"], application.get("stage"))),
+            today,
+        )
         for document in documents:
             document_expiry = parse_date(document.get("expiry_date"))
             if document_expiry and document_expiry < today:
@@ -1603,13 +2023,22 @@ def compliance_monitoring(user=Depends(get_current_user)):
             "document_expiry_date": expiry_value,
             "compliance_state": summary["state"],
             "documents_count": summary["document_count"],
+            **risk,
             "alerts": alerts,
             "compliance_configured": bool(due_value or expiry_value or documents),
         })
 
+    risk_summary = {
+        level: sum(
+            1 for item in results
+            if item["risk_level"] == level
+        )
+        for level in ("Low", "Moderate", "High", "Critical", "Unknown")
+    }
     return {
         "checked_on": today.isoformat(),
         "total_applications": len(results),
+        "risk_summary": risk_summary,
         "applications": results,
     }
 

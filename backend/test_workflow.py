@@ -1,6 +1,7 @@
 import json
 import tempfile
 import unittest
+from datetime import date, timedelta
 from pathlib import Path
 from unittest.mock import patch
 
@@ -181,6 +182,201 @@ class WorkflowAutomationTests(unittest.TestCase):
         self.assertEqual(dashboard["by_region"], {})
         self.assertEqual(dashboard["by_officer"], {})
         self.assertEqual(dashboard["by_stage"], {})
+
+    def test_workflow_risk_deadline_bands_overdue_cap_and_recommendations(self):
+        settings = main.get_compliance_settings()
+        today = date(2026, 10, 24)
+        base_application = {
+            "id": "RISK-DEADLINE",
+            "stage": "Application Review",
+            "status": "Pending",
+        }
+
+        overdue = main.calculate_workflow_risk(
+            {**base_application, "due_date": (today - timedelta(days=1)).isoformat()},
+            [],
+            settings,
+            today=today,
+        )
+        self.assertEqual(overdue["risk_score"], 32)
+        self.assertEqual(overdue["risk_level"], "Moderate")
+        self.assertEqual(overdue["risk_factors"][0]["points"], 32)
+        self.assertTrue(overdue["risk_recommendations"])
+
+        capped_overdue = main.calculate_workflow_risk(
+            {**base_application, "due_date": (today - timedelta(days=20)).isoformat()},
+            [],
+            settings,
+            today=today,
+        )
+        self.assertEqual(capped_overdue["risk_score"], 40)
+
+        upcoming = main.calculate_workflow_risk(
+            {**base_application, "due_date": (today + timedelta(days=3)).isoformat()},
+            [],
+            settings,
+            today=today,
+        )
+        self.assertEqual(upcoming["risk_score"], 25)
+        self.assertEqual(upcoming["risk_level"], "Moderate")
+
+        outside_warning = main.calculate_workflow_risk(
+            {**base_application, "due_date": (today + timedelta(days=31)).isoformat()},
+            [],
+            settings,
+            today=today,
+        )
+        self.assertEqual(outside_warning["risk_score"], 0)
+        self.assertEqual(outside_warning["risk_level"], "Low")
+
+    def test_workflow_risk_stage_age_and_risk_level_thresholds(self):
+        settings = main.get_compliance_settings()
+        today = date(2026, 10, 24)
+        application = {
+            "id": "RISK-STAGE",
+            "stage": "Document Verification",
+            "status": "Under Review",
+            "due_date": (today + timedelta(days=100)).isoformat(),
+        }
+        risk = main.calculate_workflow_risk(
+            application,
+            [],
+            settings,
+            stage_entered_at="2026-09-24T12:00:00+00:00",
+            today=today,
+        )
+        self.assertEqual(risk["risk_score"], 25)
+        stage_factor = next(
+            factor for factor in risk["risk_factors"]
+            if factor["category"] == "stage_age"
+        )
+        self.assertEqual(stage_factor["points"], 25)
+        self.assertIn("blockers", stage_factor["recommendation"])
+
+        thresholds = settings["workflow_risk_assessment"]["risk_level_thresholds"]
+        self.assertEqual(main.get_workflow_risk_level(0, thresholds), "Low")
+        self.assertEqual(main.get_workflow_risk_level(25, thresholds), "Moderate")
+        self.assertEqual(main.get_workflow_risk_level(50, thresholds), "High")
+        self.assertEqual(main.get_workflow_risk_level(75, thresholds), "Critical")
+        self.assertEqual(main.get_workflow_risk_level(None, thresholds), "Unknown")
+
+    def test_workflow_risk_compliance_caps_and_missing_required_documents(self):
+        settings = main.get_compliance_settings()
+        settings["required_document_types"] = ["Lease", "Fire Safety"]
+        today = date(2026, 10, 24)
+        application = {
+            "id": "RISK-COMPLIANCE",
+            "stage": "Application Review",
+            "status": "Under Review",
+            "due_date": "invalid-date",
+        }
+        documents = [
+            {
+                "id": 1,
+                "document_type": "Lease",
+                "name": "Signed lease",
+                "status": "Verified",
+                "expiry_date": (today - timedelta(days=1)).isoformat(),
+            },
+            {
+                "id": 2,
+                "document_type": "Electrical safety",
+                "name": "Safety certificate",
+                "status": "Pending",
+                "expiry_date": None,
+            },
+        ]
+
+        risk = main.calculate_workflow_risk(
+            application,
+            documents,
+            settings,
+            today=today,
+        )
+        compliance_factors = [
+            factor for factor in risk["risk_factors"]
+            if factor["category"] == "compliance"
+        ]
+        self.assertEqual(sum(factor["points"] for factor in compliance_factors), 35)
+        self.assertEqual(risk["risk_score"], 35)
+        self.assertEqual(risk["risk_level"], "Moderate")
+        self.assertTrue(any("Missing Fire Safety" == factor["name"] for factor in compliance_factors))
+        self.assertLessEqual(risk["risk_score"], 100)
+        self.assertTrue(any("invalid" in gap for gap in risk["risk_data_gaps"]))
+        self.assertTrue(any("renewal" in text.lower() for text in risk["risk_recommendations"]))
+        self.assertTrue(any("Fire Safety" in text for text in risk["risk_recommendations"]))
+
+    def test_workflow_risk_configuration_rejects_invalid_caps_and_thresholds(self):
+        settings = main.get_compliance_settings()["workflow_risk_assessment"]
+        invalid_caps = {
+            **settings,
+            "factor_caps": {"deadline": 40, "stage_age": 25, "compliance": 34},
+        }
+        with self.assertRaises(main.HTTPException):
+            main.validate_workflow_risk_assessment(invalid_caps)
+
+        invalid_levels = {
+            **settings,
+            "risk_level_thresholds": {
+                "low_max": 50,
+                "moderate_max": 49,
+                "high_max": 74,
+            },
+        }
+        with self.assertRaises(main.HTTPException):
+            main.validate_workflow_risk_assessment(invalid_levels)
+
+    def test_workflow_risk_missing_data_is_unknown_not_zero(self):
+        settings = main.get_compliance_settings()
+        risk = main.calculate_workflow_risk(
+            {
+                "id": "RISK-UNKNOWN",
+                "stage": "Unrecognized",
+                "status": "Under Review",
+                "due_date": "not-a-date",
+            },
+            [],
+            settings,
+            stage_entered_at="not-a-timestamp",
+            today=date(2026, 10, 24),
+        )
+        self.assertIsNone(risk["risk_score"])
+        self.assertEqual(risk["risk_level"], "Unknown")
+        self.assertGreaterEqual(len(risk["risk_data_gaps"]), 3)
+
+    def test_workflow_risk_uses_stage_entry_audit_and_monitoring_endpoint(self):
+        headers = self.login("viewer")
+        application_id = "RISK-MONITOR"
+        today = date.today()
+        self.add_application(
+            application_id,
+            due_date=(today - timedelta(days=1)).isoformat(),
+            stage="Document Verification",
+            status="Under Review",
+        )
+        with main.connect_db() as connection:
+            connection.execute("""
+                INSERT INTO audit_events
+                    (application_id, action, stage, details, timestamp, actor)
+                VALUES (?, 'Stage advanced', ?, 'Previous stage: Application Review',
+                        ?, 'officer')
+            """, (
+                application_id,
+                "Document Verification",
+                (today - timedelta(days=30)).isoformat() + "T12:00:00+00:00",
+            ))
+
+        response = self.client.get("/api/monitoring", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        result = next(
+            item for item in response.json()["applications"]
+            if item["id"] == application_id
+        )
+        self.assertEqual(result["risk_score"], 57)
+        self.assertEqual(result["risk_level"], "High")
+        self.assertTrue(result["risk_factors"])
+        self.assertTrue(result["risk_recommendations"])
+        self.assertIn("High", response.json()["risk_summary"])
 
     def test_only_admin_can_create_applications(self):
         payload = self.create_payload("TEST-OFFICER-CREATE")

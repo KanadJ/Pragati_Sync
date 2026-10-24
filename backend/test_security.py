@@ -72,6 +72,26 @@ class RoleBasedAccessTests(unittest.TestCase):
                         200,
                     )
 
+    def test_monitoring_exposes_explainable_risk_to_authenticated_roles(self):
+        for username in ("admin", "officer", "viewer"):
+            response = self.client.get(
+                "/api/monitoring",
+                headers=self.login(username),
+            )
+            self.assertEqual(response.status_code, 200)
+            body = response.json()
+            self.assertEqual(
+                set(body["risk_summary"]),
+                {"Low", "Moderate", "High", "Critical", "Unknown"},
+            )
+            self.assertTrue(body["applications"])
+            application = body["applications"][0]
+            self.assertIn("risk_score", application)
+            self.assertIn("risk_level", application)
+            self.assertIn("risk_factors", application)
+            self.assertIn("risk_recommendations", application)
+            self.assertIn("risk_data_gaps", application)
+
     def test_invalid_bearer_token_is_unauthorized(self):
         response = self.client.get(
             "/api/applications",
