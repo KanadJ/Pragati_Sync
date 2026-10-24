@@ -12,6 +12,15 @@ const FALLBACK_STAGES = [
   'Completed',
 ]
 
+const PAGE_DESCRIPTIONS = {
+  Applications: 'Review application records, configured workflows, and available actions.',
+  'EVC Tracking': 'Schedule and follow Expert Visit Committee cases required by configured approval routes.',
+  'Document Tracking': 'Review document validity, renewal submissions, and verification status.',
+  Monitoring: 'Review configured deadline alerts, document status, and explainable prototype risk assessments.',
+  Notifications: 'Review compliance notifications and their current read or resolution state.',
+  'Audit Trail': 'Review recorded workflow and compliance actions with their actor and timestamp.',
+}
+
 function formatKolkataTimestamp(value, includeTime = true) {
   if (!value) return ''
   const timestamp = new Date(value)
@@ -28,8 +37,9 @@ function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || '')
   const [user, setUser] = useState(null)
   const [authChecking, setAuthChecking] = useState(true)
-  const [username, setUsername] = useState('admin')
+  const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
+  const [showPassword, setShowPassword] = useState(false)
   const [loginBusy, setLoginBusy] = useState(false)
   const [loginError, setLoginError] = useState('')
 
@@ -77,6 +87,7 @@ function App() {
   const [expiryDate, setExpiryDate] = useState('')
   const [notice, setNotice] = useState('')
   const [page, setPage] = useState('Dashboard')
+  const [mobileNavOpen, setMobileNavOpen] = useState(false)
 
   const role = user?.role || ''
   const isAdmin = role.toLowerCase() === 'admin'
@@ -368,6 +379,79 @@ function App() {
     .filter((item) => item.risk_score !== null && item.risk_score !== undefined)
     .sort((left, right) => right.risk_score - left.risk_score)
     .slice(0, 5)
+  const priorityApplications = useMemo(() => {
+    const applicationById = new Map(applications.map((application) => [application.id, application]))
+
+    const rankedApplications = (monitoring?.applications || [])
+      .flatMap((item) => {
+        if (!item?.id) return []
+
+        const alerts = (item.alerts || []).map((alert) => (
+          typeof alert === 'string'
+            ? { type: '', message: alert }
+            : { type: alert?.type || '', message: alert?.message || '' }
+        ))
+        const overdueAlert = alerts.find((alert) =>
+          /overdue/i.test(`${alert.type} ${alert.message}`)
+        )
+        const expiredAlert = alerts.find((alert) =>
+          /document expired|expired document/i.test(alert.type)
+          || (!alert.type && /document expired|expired document/i.test(alert.message))
+        )
+        const expiringAlert = alerts.find((alert) =>
+          /document expiring/i.test(alert.type)
+          || (!alert.type && /document.*(expiring|expires)|(?:expiring|expires).*document/i.test(alert.message))
+        )
+        const riskLevel = item.risk_level || 'Unknown'
+        const highRisk = ['Critical', 'High'].includes(riskLevel)
+
+        if (!overdueAlert && !highRisk && !expiredAlert && !expiringAlert) return []
+
+        let priority
+        let priorityRank
+        let priorityReason
+        if (overdueAlert) {
+          priority = 'Overdue'
+          priorityRank = 0
+          priorityReason = overdueAlert.message || overdueAlert.type || 'Application deadline overdue'
+        } else if (highRisk) {
+          priority = `${riskLevel} risk`
+          priorityRank = 1
+          const contributingFactor = (item.risk_factors || []).find((factor) => factor.points > 0)
+          priorityReason = contributingFactor?.explanation || `Rule-based assessment reports ${riskLevel.toLowerCase()} risk.`
+        } else {
+          const expiryAlert = expiredAlert || expiringAlert
+          priority = expiredAlert ? 'Expired document' : 'Expiring document'
+          priorityRank = 2
+          priorityReason = expiryAlert.message || expiryAlert.type || priority
+        }
+
+        return [{
+          item,
+          application: applicationById.get(item.id),
+          priority,
+          priorityRank,
+          riskRank: riskLevel === 'Critical' ? 0 : 1,
+          priorityReason,
+        }]
+      })
+      .sort((left, right) =>
+        left.priorityRank - right.priorityRank
+        || (left.priorityRank === 1
+          ? left.riskRank - right.riskRank
+            || (right.item.risk_score ?? -1) - (left.item.risk_score ?? -1)
+          : 0)
+        || left.item.id.localeCompare(right.item.id)
+      )
+    const seenIds = new Set()
+    return rankedApplications
+      .filter(({ item }) => {
+        if (seenIds.has(item.id)) return false
+        seenIds.add(item.id)
+        return true
+      })
+      .slice(0, 6)
+  }, [applications, monitoring])
 
   async function performAction(action, reason = '') {
     if (!selected || busy || !canProcess) return
@@ -704,30 +788,62 @@ function App() {
         : ''
 
   if (authChecking) {
-    return <div className="app-shell"><main className="main-content"><div className="notice">Checking your session...</div></main></div>
+    return (
+      <div className="login-shell">
+        <main className="login-layout">
+          <div className="login-brand-lockup">
+            <div className="brand-mark" aria-hidden="true">A</div>
+            <div>
+              <strong>AICTE Approval &amp; Compliance</strong>
+              <span>Institutional workflow workspace</span>
+            </div>
+          </div>
+          <div className="login-card login-card-loading" role="status" aria-live="polite">
+            <span className="login-eyebrow">SECURE WORKSPACE</span>
+            <h1>Checking your session</h1>
+            <p className="muted">Please wait while we verify your access.</p>
+            <div className="login-loading-line" aria-hidden="true" />
+          </div>
+        </main>
+      </div>
+    )
   }
 
   if (!user || !token) {
     return (
-      <div className="app-shell">
-        <main className="main-content">
-          <section className="page-content">
-            <div className="brand" style={{ marginBottom: 32 }}>
-              <div className="brand-mark">A</div>
+      <div className="login-shell">
+        <main className="login-layout">
+          <section className="login-intro" aria-labelledby="login-product-name">
+            <div className="login-brand-lockup">
+              <div className="brand-mark" aria-hidden="true">A</div>
               <div>
-                <strong>AICTE Portal</strong>
-                <span>Approval &amp; Compliance</span>
+                <strong>AICTE Approval &amp; Compliance</strong>
+                <span>Institutional workflow workspace</span>
               </div>
             </div>
+            <div className="login-intro-copy">
+              <span className="login-eyebrow">APPROVAL WORKFLOW · COMPLIANCE MONITORING</span>
+              <h1 id="login-product-name">A clearer view of every approval.</h1>
+              <p>
+                Review application progress, follow compliance actions, and keep
+                institutional records moving through their configured workflows.
+              </p>
+            </div>
+            <div className="login-intro-footer">
+              <span className="login-security-mark" aria-hidden="true">✓</span>
+              <span>Authorized access for your assigned role</span>
+            </div>
+          </section>
 
-            <div className="panel" style={{ maxWidth: 440, margin: '8vh auto', padding: 28 }}>
-              <div className="eyebrow">SECURE WORKSPACE</div>
-              <h1 style={{ marginTop: 8 }}>Sign in</h1>
-              <p className="muted">Sign in to manage approval workflows and compliance.</p>
+          <section className="login-form-region" aria-labelledby="login-title">
+            <div className="login-card">
+              <span className="login-eyebrow">SECURE WORKSPACE</span>
+              <h2 id="login-title">Welcome back</h2>
+              <p className="muted">Sign in with your authorized account to continue.</p>
 
-              {loginError && <div className="notice" role="alert">{loginError}</div>}
+              {loginError && <div className="notice login-error" role="alert">{loginError}</div>}
 
-              <form onSubmit={handleLogin}>
+              <form className="login-form" onSubmit={handleLogin}>
                 <label htmlFor="login-username">Username</label>
                 <input
                   id="login-username"
@@ -735,31 +851,44 @@ function App() {
                   value={username}
                   onChange={(event) => setUsername(event.target.value)}
                   required
+                  disabled={loginBusy}
                 />
 
-                <label htmlFor="login-password" style={{ display: 'block', marginTop: 16 }}>Password</label>
-                <input
-                  id="login-password"
-                  type="password"
-                  autoComplete="current-password"
-                  value={password}
-                  onChange={(event) => setPassword(event.target.value)}
-                  required
-                />
+                <label htmlFor="login-password">Password</label>
+                <div className="password-field">
+                  <input
+                    id="login-password"
+                    type={showPassword ? 'text' : 'password'}
+                    autoComplete="current-password"
+                    value={password}
+                    onChange={(event) => setPassword(event.target.value)}
+                    required
+                    disabled={loginBusy}
+                  />
+                  <button
+                    className="password-toggle"
+                    type="button"
+                    aria-label={showPassword ? 'Hide password' : 'Show password'}
+                    aria-pressed={showPassword}
+                    disabled={loginBusy}
+                    onClick={() => setShowPassword((visible) => !visible)}
+                  >
+                    {showPassword ? 'Hide' : 'Show'}
+                  </button>
+                </div>
 
-                <button className="primary-button" type="submit" disabled={loginBusy} style={{ marginTop: 20, width: '100%' }}>
-                  {loginBusy ? 'Signing in...' : 'Sign in'}
+                <button className="primary-button login-submit" type="submit" disabled={loginBusy}>
+                  {loginBusy ? (
+                    <>
+                      <span className="button-spinner" aria-hidden="true" />
+                      Signing in...
+                    </>
+                  ) : 'Sign in'}
                 </button>
               </form>
-
-              <div className="prototype-note" style={{ marginTop: 24 }}>
-                Demo accounts:
-                <p>Admin: admin / Admin@26262</p>
-                <p>Officer: officer / Officer@26262</p>
-                <p>Viewer: viewer / Viewer@26262</p>
-                <span>Demonstration credentials only. Do not use these passwords in production.</span>
-              </div>
+              <p className="login-footnote">This demonstration system does not provide account recovery or registration.</p>
             </div>
+            <p className="login-form-footer">AICTE Approval &amp; Compliance System <span>·</span> Prototype workspace</p>
           </section>
         </main>
       </div>
@@ -767,10 +896,18 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
+    <div className="app-shell app-shell-authenticated">
+      {mobileNavOpen && (
+        <button
+          className="nav-backdrop"
+          type="button"
+          aria-label="Close navigation menu"
+          onClick={() => setMobileNavOpen(false)}
+        />
+      )}
+      <aside className={`sidebar ${mobileNavOpen ? 'sidebar-open' : ''}`} aria-label="Main navigation">
         <div className="brand">
-          <div className="brand-mark">A</div>
+          <div className="brand-mark" aria-hidden="true">A</div>
           <div>
             <strong>AICTE Portal</strong>
             <span>Approval &amp; Compliance</span>
@@ -790,10 +927,20 @@ function App() {
           <button
             key={name}
             className={`nav-item ${page === name ? 'active' : ''}`}
-            onClick={() => { setPage(name); setNotice('') }}
+            aria-current={page === name ? 'page' : undefined}
+            onClick={() => {
+              setPage(name)
+              setNotice('')
+              setMobileNavOpen(false)
+            }}
           >
-            <span className="nav-symbol">{symbol}</span>
-            {name}{name === 'Notifications' && notifications.some((item) => !item.is_read) ? ` (${notifications.filter((item) => !item.is_read).length})` : ''}
+            <span className="nav-symbol" aria-hidden="true">{symbol}</span>
+            <span className="nav-item-label">{name}</span>
+            {name === 'Notifications' && notifications.some((item) => !item.is_read) && (
+              <span className="nav-count" aria-label={`${notifications.filter((item) => !item.is_read).length} unread`}>
+                {notifications.filter((item) => !item.is_read).length}
+              </span>
+            )}
           </button>
         ))}
 
@@ -808,14 +955,27 @@ function App() {
 
       <main className="main-content">
         <header className="topbar">
-          <div className="breadcrumb">AICTE <span>/</span> {page}</div>
+          <div className="topbar-leading">
+            <button
+              className="mobile-menu-button"
+              type="button"
+              aria-label={mobileNavOpen ? 'Close navigation menu' : 'Open navigation menu'}
+              aria-expanded={mobileNavOpen}
+              onClick={() => setMobileNavOpen((open) => !open)}
+            >
+              <span />
+              <span />
+              <span />
+            </button>
+            <div className="breadcrumb"><span className="breadcrumb-root">AICTE WORKSPACE</span><span className="breadcrumb-separator">/</span>{page}</div>
+          </div>
           <div className="user-chip">
-            <div className="avatar">{(user.username || 'U').slice(0, 2).toUpperCase()}</div>
-            <div>
+            <div className="avatar" aria-hidden="true">{(user.username || 'U').slice(0, 2).toUpperCase()}</div>
+            <div className="user-identity">
               <strong>{user.username}</strong>
-              <span>{role}</span>
+              <span className="role-label">{role}</span>
             </div>
-            <button className="secondary-button" onClick={handleLogout}>Logout</button>
+            <button className="secondary-button logout-button" onClick={handleLogout}>Log out</button>
           </div>
         </header>
 
@@ -824,12 +984,12 @@ function App() {
 
           <div className="page-heading">
             <div>
-              <div className="eyebrow">APPROVAL MANAGEMENT SYSTEM</div>
+              <div className="eyebrow">APPROVAL MANAGEMENT SYSTEM <span className="heading-divider">/</span> {page.toUpperCase()}</div>
               <h1>{page === 'Dashboard' ? 'Application Dashboard' : page}</h1>
-              <p>Monitor institutional applications and manage approval workflows.</p>
-              {!canProcess && <p className="muted">Viewer mode · Read-only access</p>}
+              <p>{PAGE_DESCRIPTIONS[page] || 'Monitor institutional applications and manage approval workflows.'}</p>
+              {!canProcess && <p className="viewer-mode-label"><span aria-hidden="true">●</span> Viewer mode · Read-only access</p>}
             </div>
-            <button className="primary-button" onClick={() => setPage('Applications')}>
+            <button className="primary-button page-heading-action" onClick={() => setPage('Applications')}>
               View applications <span>→</span>
             </button>
           </div>
@@ -843,11 +1003,13 @@ function App() {
 
           {page === 'Dashboard' && (
             <>
-              <div className="stats-grid">
-                <Stat label="Total applications" value={dashboardData?.total_applications ?? '—'} note="Across all regions" symbol="▤" />
-                <Stat label="Pending action" value={dashboardData?.pending_requests ?? '—'} note="Awaiting processing" symbol="◷" />
+              <div className="stats-grid dashboard-kpi-grid">
+                <Stat label="Total applications" value={dashboardData?.total_applications ?? '—'} note="All recorded applications" symbol="▤" />
+                <Stat label="Pending action" value={dashboardData?.pending_requests ?? '—'} note="Includes returned applications" symbol="◷" />
+                <Stat label="Overdue applications" value={dashboardData?.overdue_applications ?? '—'} note="Incomplete applications past deadline" symbol="!" />
+                <Stat label="Upcoming deadlines" value={dashboardData?.deadlines_soon ?? '—'} note="Due today through the next 7 days" symbol="⌁" />
                 <Stat label="Approved" value={dashboardData?.approved ?? '—'} note="Completed applications" symbol="✓" />
-                <Stat label="Returned" value={dashboardData ? dashboardData.by_status?.Returned || 0 : '—'} note="Requires correction" symbol="↶" />
+                <Stat label="Returned" value={dashboardData ? dashboardData.by_status?.Returned || 0 : '—'} note="Counted within pending action" symbol="↶" />
               </div>
 
               {dashboardError ? (
@@ -861,12 +1023,142 @@ function App() {
               ) : !dashboardData ? (
                 <div className="panel dashboard-state" role="status">Loading dashboard analytics...</div>
               ) : (
-                <div className="dashboard-summary-grid">
+                <div className="dashboard-distribution-grid">
                   <DashboardSummary title="Applications by region" data={dashboardData.by_region} />
-                  <DashboardSummary title="Applications by assigned officer" data={dashboardData.by_officer} />
-                  <DashboardSummary title="Applications by workflow stage" data={dashboardData.by_stage} />
+                  <DashboardSummary title="Workflow stages" data={dashboardData.by_stage} />
+                  <DashboardSummary title="Assigned officer workload" data={dashboardData.by_officer} />
+                  <DashboardSummary title="Risk distribution" data={riskSummary} />
                 </div>
               )}
+
+              <div className="dashboard-section-heading">
+                <div>
+                  <h2>Priority applications</h2>
+                  <p>Ordered by overdue deadlines, high or critical risk, then document expiry alerts.</p>
+                </div>
+                <span className="record-count">{priorityApplications.length} priority records</span>
+              </div>
+              <div className="dashboard-priority-activity-grid">
+                <section className="panel dashboard-priority-panel" aria-labelledby="priority-applications-heading">
+                  <div className="section-heading">
+                    <div>
+                      <h2 id="priority-applications-heading">Needs attention</h2>
+                      <p>Open an application to review its existing details.</p>
+                    </div>
+                  </div>
+                  {priorityApplications.length === 0 ? (
+                    <div className="empty-state">
+                      {monitoring ? 'No overdue, high-risk, or document-expiry applications are currently identified.' : 'Priority applications are unavailable until monitoring data loads.'}
+                    </div>
+                  ) : (
+                    <div className="table-wrap dashboard-priority-table-wrap">
+                      <table className="dashboard-priority-table">
+                        <thead>
+                          <tr>
+                            <th>APPLICATION</th>
+                            <th>REGION</th>
+                            <th>STAGE</th>
+                            <th>DEADLINE</th>
+                            <th>RISK</th>
+                            <th>PRIORITY / REASON</th>
+                            <th />
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {priorityApplications.map(({ item, application, priority, priorityReason }) => (
+                            <tr
+                              key={item.id}
+                              className="dashboard-priority-row"
+                              tabIndex={0}
+                              aria-label={`Open application details for ${item.id}`}
+                              onClick={() => {
+                                setSelectedId(item.id)
+                                setPage('Applications')
+                              }}
+                              onKeyDown={(event) => {
+                                if (event.key === 'Enter' || event.key === ' ') {
+                                  event.preventDefault()
+                                  setSelectedId(item.id)
+                                  setPage('Applications')
+                                }
+                              }}
+                            >
+                              <td>
+                                <button
+                                  className="application-link"
+                                  onClick={() => {
+                                    setSelectedId(item.id)
+                                    setPage('Applications')
+                                  }}
+                                >
+                                  {item.institution || application?.institution || item.id}
+                                </button>
+                                <div className="institution-name">{item.id}</div>
+                              </td>
+                              <td>{application?.region || 'Unknown'}</td>
+                              <td>{item.stage || application?.stage || 'Unknown'}</td>
+                              <td>{item.due_date || application?.due_date || 'Not set'}</td>
+                              <td><span className={`risk-badge risk-${(item.risk_level || 'Unknown').toLowerCase()}`}>{item.risk_level || 'Unknown'}</span></td>
+                              <td>
+                                <strong className="priority-label">{priority}</strong>
+                                <div className="priority-reason">{priorityReason}</div>
+                                {['Critical', 'High'].includes(item.risk_level) && (item.risk_recommendations || []).length > 0 && (
+                                  <div className="priority-recommendation">Recommended: {item.risk_recommendations[0]}</div>
+                                )}
+                              </td>
+                              <td>
+                                <button
+                                  className="open-button"
+                                  aria-label={`Open application ${item.id}`}
+                                  onClick={(event) => {
+                                    event.stopPropagation()
+                                    setSelectedId(item.id)
+                                    setPage('Applications')
+                                  }}
+                                >→</button>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </section>
+
+                <section className="panel dashboard-activity-panel" aria-labelledby="recent-activity-heading">
+                  <div className="section-heading">
+                    <div>
+                      <h2 id="recent-activity-heading">Recent activity</h2>
+                      <p>Latest events from the existing audit trail.</p>
+                    </div>
+                  </div>
+                  {auditEvents.length === 0 ? (
+                    <div className="empty-state">No audit activity is available.</div>
+                  ) : auditEvents.slice(0, 5).map((event) => (
+                    <div className="dashboard-activity-item" key={event.id}>
+                      <span className="dashboard-activity-mark" aria-hidden="true">•</span>
+                      <div className="dashboard-activity-copy">
+                        <strong>{event.action || 'Audit event'}</strong>
+                        <p>{event.application_id || 'Application unavailable'}{event.stage ? ` · ${event.stage}` : ''}</p>
+                        {event.actor && <span>By {event.actor}</span>}
+                        <time dateTime={event.timestamp || undefined}>
+                          {event.timestamp ? formatKolkataTimestamp(event.timestamp) : 'Timestamp unavailable'}
+                        </time>
+                      </div>
+                      {event.application_id && (
+                        <button
+                          className="activity-open-button"
+                          aria-label={`Open application ${event.application_id}`}
+                          onClick={() => {
+                            setSelectedId(event.application_id)
+                            setPage('Applications')
+                          }}
+                        >→</button>
+                      )}
+                    </div>
+                  ))}
+                </section>
+              </div>
 
               <div className="panel risk-overview">
                 <div className="section-heading">
@@ -912,8 +1204,8 @@ function App() {
           )}
 
           {page === 'Applications' && (
-            <>
-              <div className="section-heading">
+            <div className="applications-page">
+              <div className="section-heading applications-heading">
                 <div><h2>All applications</h2><p>Choose a record to open its review panel.</p></div>
                 {isAdmin && (
                   <button
@@ -998,7 +1290,7 @@ function App() {
               )}
               <ApplicationFilters search={search} setSearch={setSearch} filter={filter} setFilter={setFilter} />
               <ApplicationTable rows={filtered} selectedId={selectedId} onSelect={setSelectedId} />
-            </>
+            </div>
           )}
 
           {page === 'Monitoring' && (
@@ -1041,7 +1333,7 @@ function App() {
                   )
 
                   return (
-                    <div className="audit-row" key={item.id}>
+                    <div className="audit-row monitoring-application-row" key={item.id}>
                       <div className="audit-icon">{alerts.length ? '!' : '✓'}</div>
                       <div>
                         <strong>{item.institution}</strong>
@@ -1066,7 +1358,7 @@ function App() {
                         </span>
 
                         {alerts.length ? alerts.map((alert, index) => (
-                          <p key={`${item.id}-${index}`}>
+                          <p className={`compliance-alert compliance-alert-${(alert.severity || 'info').toLowerCase()}`} key={`${item.id}-${index}`}>
                             <strong>{alert.severity || 'Info'}:</strong> {alert.message || alert.type || 'Compliance alert'}
                           </p>
                         )) : <p>No configured date alerts</p>}
@@ -1087,7 +1379,7 @@ function App() {
           )}
 
           {page === 'EVC Tracking' && (
-            <div className="panel">
+            <div className="panel evc-tracking-page">
               <div className="section-heading">
                 <div>
                   <h2>Expert Visit Committee tracking</h2>
@@ -1181,7 +1473,7 @@ function App() {
           )}
 
           {page === 'Notifications' && (
-            <div className="panel">
+            <div className="panel notifications-page">
               <div className="section-heading">
                 <div><h2>In-app notifications</h2><p>Compliance alerts and deadline escalations linked to applications.</p></div>
                 <span className="record-count">{notifications.filter((item) => !item.is_read).length} unread</span>
@@ -1211,7 +1503,7 @@ function App() {
           )}
 
           {page === 'Document Tracking' && (
-            <div className="panel">
+            <div className="panel document-tracking-page">
               <div className="section-heading">
                 <div>
                   <h2>Document expiry and renewal tracking</h2>
@@ -1312,7 +1604,7 @@ function App() {
           )}
 
           {page === 'Audit Trail' && (
-            <div className="panel">
+            <div className="panel audit-page">
               <div className="section-heading">
                 <div><h2>Persistent audit trail</h2><p>Events loaded from the backend database.</p></div>
                 <button className="secondary-button" onClick={() => refreshData().catch((error) => setNotice(error.message))}>Refresh</button>
@@ -1664,18 +1956,39 @@ function DashboardSummary({ title, data = {} }) {
     .sort(([leftName, leftCount], [rightName, rightCount]) =>
       rightCount - leftCount || leftName.localeCompare(rightName)
     )
+  const maximumCount = Math.max(0, ...entries.map(([, count]) => Number(count) || 0))
 
   return (
     <div className="panel dashboard-summary">
       <h2>{title}</h2>
       {entries.length === 0 ? (
         <div className="empty-state">No applications to summarize.</div>
-      ) : entries.map(([label, count]) => (
-        <div className="dashboard-summary-row" key={label}>
-          <span>{label}</span>
-          <strong>{count}</strong>
+      ) : (
+        <div className="dashboard-bar-list" role="list">
+          {entries.map(([label, count]) => {
+            const numericCount = Number(count) || 0
+            const barWidth = maximumCount > 0 ? (numericCount / maximumCount) * 100 : 0
+            return (
+              <div className="dashboard-bar-item" role="listitem" aria-label={`${label}: ${numericCount}`} key={label}>
+                <div className="dashboard-bar-label">
+                  <span>{label}</span>
+                  <strong>{numericCount}</strong>
+                </div>
+                <div
+                  className="dashboard-bar-track"
+                  role="progressbar"
+                  aria-label={`${label} applications`}
+                  aria-valuemin="0"
+                  aria-valuemax={maximumCount || 1}
+                  aria-valuenow={numericCount}
+                >
+                  <span style={{ width: `${barWidth}%` }} />
+                </div>
+              </div>
+            )
+          })}
         </div>
-      ))}
+      )}
     </div>
   )
 }
