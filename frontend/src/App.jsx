@@ -3,6 +3,8 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import './App.css'
 
 const API = 'http://localhost:8000'
+const TOKEN_KEY = 'aicte_demo_token'
+
 const FALLBACK_STAGES = [
   'Application Review',
   'Document Verification',
@@ -11,6 +13,14 @@ const FALLBACK_STAGES = [
 ]
 
 function App() {
+  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || '')
+  const [user, setUser] = useState(null)
+  const [authChecking, setAuthChecking] = useState(true)
+  const [username, setUsername] = useState('admin')
+  const [password, setPassword] = useState('')
+  const [loginBusy, setLoginBusy] = useState(false)
+  const [loginError, setLoginError] = useState('')
+
   const [applications, setApplications] = useState([])
   const [workflows, setWorkflows] = useState({})
   const [auditEvents, setAuditEvents] = useState([])
@@ -27,19 +37,40 @@ function App() {
   const [notice, setNotice] = useState('')
   const [page, setPage] = useState('Dashboard')
 
+  const role = user?.role || ''
+  const isAdmin = role.toLowerCase() === 'admin'
+  const canProcess = ['admin', 'officer'].includes(role.toLowerCase())
+  const canEditWorkflow = isAdmin
+
   const request = useCallback(async (path, options = {}) => {
+    const currentToken = localStorage.getItem(TOKEN_KEY)
+
     const response = await fetch(`${API}${path}`, {
       ...options,
       headers: {
         ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(currentToken
+          ? { Authorization: `Bearer ${currentToken}` }
+          : {}),
         ...options.headers,
       },
     })
 
     const data = await response.json().catch(() => ({}))
 
+    if (response.status === 401 && path !== '/api/auth/login') {
+      localStorage.removeItem(TOKEN_KEY)
+      setToken('')
+      setUser(null)
+      throw new Error('Your session has expired. Please log in again.')
+    }
+
     if (!response.ok) {
-      throw new Error(data.detail || `Request failed (${response.status})`)
+      throw new Error(
+        typeof data.detail === 'string'
+          ? data.detail
+          : `Request failed (${response.status})`
+      )
     }
 
     return data
@@ -65,11 +96,113 @@ function App() {
     })
   }, [request])
 
+  // Validate an existing session when the page opens.
   useEffect(() => {
+    let active = true
+
+    async function checkSession() {
+      const savedToken = localStorage.getItem(TOKEN_KEY)
+
+      if (!savedToken) {
+        setAuthChecking(false)
+        setLoading(false)
+        return
+      }
+
+      try {
+        const data = await request('/api/auth/me')
+        if (!active) return
+        setToken(savedToken)
+        setUser(data.user || data)
+      } catch {
+        if (!active) return
+        localStorage.removeItem(TOKEN_KEY)
+        setToken('')
+        setUser(null)
+      } finally {
+        if (active) setAuthChecking(false)
+      }
+    }
+
+    checkSession()
+
+    return () => {
+      active = false
+    }
+  }, [request])
+
+  // Load application data only after authentication.
+  useEffect(() => {
+    if (!user || !token) {
+      setLoading(false)
+      return
+    }
+
+    let active = true
+    setLoading(true)
+
     refreshData()
-      .catch((error) => setNotice(`Could not load backend data: ${error.message}`))
-      .finally(() => setLoading(false))
-  }, [refreshData])
+      .catch((error) => {
+        if (active) setNotice(`Could not load backend data: ${error.message}`)
+      })
+      .finally(() => {
+        if (active) setLoading(false)
+      })
+
+    return () => {
+      active = false
+    }
+  }, [user, token, refreshData])
+
+  async function handleLogin(event) {
+    event.preventDefault()
+    setLoginBusy(true)
+    setLoginError('')
+
+    try {
+      const data = await request('/api/auth/login', {
+        method: 'POST',
+        body: JSON.stringify({ username: username.trim(), password }),
+      })
+
+      if (!data.access_token) {
+        throw new Error('The server did not return an access token.')
+      }
+
+      localStorage.setItem(TOKEN_KEY, data.access_token)
+      setToken(data.access_token)
+      setUser(data.user)
+      setPassword('')
+      setPage('Dashboard')
+      setNotice('')
+    } catch (error) {
+      setLoginError(error.message || 'Login failed.')
+    } finally {
+      setLoginBusy(false)
+      setAuthChecking(false)
+    }
+  }
+
+  async function handleLogout() {
+    try {
+      await request('/api/auth/logout', { method: 'POST' })
+    } catch {
+      // Clear the local session even if the server is unavailable.
+    }
+
+    localStorage.removeItem(TOKEN_KEY)
+    setToken('')
+    setUser(null)
+    setApplications([])
+    setWorkflows({})
+    setAuditEvents([])
+    setMonitoring(null)
+    setSelectedId('')
+    setShowReturn(false)
+    setNotice('')
+    setLoginError('')
+    setPage('Dashboard')
+  }
 
   const selected = applications.find((item) => item.id === selectedId)
 
@@ -80,6 +213,7 @@ function App() {
 
   const filtered = useMemo(() => {
     const query = search.toLowerCase()
+
     return applications.filter((item) => {
       const matchesSearch =
         `${item.id} ${item.institution} ${item.officer} ${item.region}`
@@ -99,8 +233,33 @@ function App() {
     returned: applications.filter((item) => item.status === 'Returned').length,
   }
 
+  // Monitoring alerts are objects: { severity, type, message }.
+  const allAlerts = (monitoring?.applications || []).flatMap((item) =>
+    (item.alerts || []).map((alert) =>
+      typeof alert === 'string'
+        ? { severity: 'Warning', type: 'general', message: alert }
+        : alert
+    )
+  )
+
+  const overdueCount = (monitoring?.applications || []).filter((item) =>
+    (item.alerts || []).some((alert) => {
+      const message = typeof alert === 'string' ? alert : alert.message || ''
+      const type = typeof alert === 'string' ? '' : alert.type || ''
+      return /overdue/i.test(message) || /overdue/i.test(type)
+    })
+  ).length
+
+  const expiryCount = (monitoring?.applications || []).filter((item) =>
+    (item.alerts || []).some((alert) => {
+      const message = typeof alert === 'string' ? alert : alert.message || ''
+      const type = typeof alert === 'string' ? '' : alert.type || ''
+      return /document|expir/i.test(`${message} ${type}`)
+    })
+  ).length
+
   async function performAction(action, reason = '') {
-    if (!selected || busy) return
+    if (!selected || busy || !canProcess) return
 
     setBusy(true)
     setNotice('')
@@ -118,9 +277,11 @@ function App() {
       await refreshData()
       setShowReturn(false)
       setReturnReason('')
-      setNotice(action === 'advance'
-        ? 'Application stage updated successfully.'
-        : 'Application returned successfully. Audit history saved.')
+      setNotice(
+        action === 'advance'
+          ? 'Application stage updated successfully.'
+          : 'Application returned successfully. Audit history saved.'
+      )
     } catch (error) {
       setNotice(error.message)
     } finally {
@@ -129,7 +290,8 @@ function App() {
   }
 
   async function changeWorkflow(route) {
-    if (!selected || busy) return
+    if (!selected || busy || !canEditWorkflow) return
+
     setBusy(true)
     setNotice('')
 
@@ -138,6 +300,7 @@ function App() {
         `/api/applications/${encodeURIComponent(selected.id)}/workflow`,
         { method: 'POST', body: JSON.stringify({ workflow_route: route }) }
       )
+
       await refreshData()
       setNotice('Workflow route updated successfully.')
     } catch (error) {
@@ -148,7 +311,8 @@ function App() {
   }
 
   async function saveCompliance() {
-    if (!selected || busy) return
+    if (!selected || busy || !canProcess) return
+
     setBusy(true)
     setNotice('')
 
@@ -175,6 +339,69 @@ function App() {
   const selectedAudit = auditEvents.filter(
     (event) => event.application_id === selectedId
   )
+
+  if (authChecking) {
+    return <div className="app-shell"><main className="main-content"><div className="notice">Checking your session...</div></main></div>
+  }
+
+  if (!user || !token) {
+    return (
+      <div className="app-shell">
+        <main className="main-content">
+          <section className="page-content">
+            <div className="brand" style={{ marginBottom: 32 }}>
+              <div className="brand-mark">A</div>
+              <div>
+                <strong>AICTE Portal</strong>
+                <span>Approval &amp; Compliance</span>
+              </div>
+            </div>
+
+            <div className="panel" style={{ maxWidth: 440, margin: '8vh auto', padding: 28 }}>
+              <div className="eyebrow">SECURE WORKSPACE</div>
+              <h1 style={{ marginTop: 8 }}>Sign in</h1>
+              <p className="muted">Sign in to manage approval workflows and compliance.</p>
+
+              {loginError && <div className="notice" role="alert">{loginError}</div>}
+
+              <form onSubmit={handleLogin}>
+                <label htmlFor="login-username">Username</label>
+                <input
+                  id="login-username"
+                  autoComplete="username"
+                  value={username}
+                  onChange={(event) => setUsername(event.target.value)}
+                  required
+                />
+
+                <label htmlFor="login-password" style={{ display: 'block', marginTop: 16 }}>Password</label>
+                <input
+                  id="login-password"
+                  type="password"
+                  autoComplete="current-password"
+                  value={password}
+                  onChange={(event) => setPassword(event.target.value)}
+                  required
+                />
+
+                <button className="primary-button" type="submit" disabled={loginBusy} style={{ marginTop: 20, width: '100%' }}>
+                  {loginBusy ? 'Signing in...' : 'Sign in'}
+                </button>
+              </form>
+
+              <div className="prototype-note" style={{ marginTop: 24 }}>
+                Demo accounts:
+                <p>Admin: admin / Admin@26262</p>
+                <p>Officer: officer / Officer@26262</p>
+                <p>Viewer: viewer / Viewer@26262</p>
+                <span>Demonstration credentials only. Do not use these passwords in production.</span>
+              </div>
+            </div>
+          </section>
+        </main>
+      </div>
+    )
+  }
 
   return (
     <div className="app-shell">
@@ -217,8 +444,12 @@ function App() {
         <header className="topbar">
           <div className="breadcrumb">AICTE <span>/</span> {page}</div>
           <div className="user-chip">
-            <div className="avatar">AD</div>
-            <div><strong>Administrator</strong><span>System Admin</span></div>
+            <div className="avatar">{(user.username || 'U').slice(0, 2).toUpperCase()}</div>
+            <div>
+              <strong>{user.username}</strong>
+              <span>{role}</span>
+            </div>
+            <button className="secondary-button" onClick={handleLogout}>Logout</button>
           </div>
         </header>
 
@@ -230,6 +461,7 @@ function App() {
               <div className="eyebrow">APPROVAL MANAGEMENT SYSTEM</div>
               <h1>{page === 'Dashboard' ? 'Application Dashboard' : page}</h1>
               <p>Monitor institutional applications and manage approval workflows.</p>
+              {!canProcess && <p className="muted">Viewer mode · Read-only access</p>}
             </div>
             <button className="primary-button" onClick={() => setPage('Applications')}>
               View applications <span>→</span>
@@ -276,8 +508,8 @@ function App() {
             <>
               <div className="stats-grid">
                 <Stat label="Applications monitored" value={monitoring?.total_applications ?? '—'} note="Current records" symbol="▤" />
-                <Stat label="Overdue deadlines" value={monitoring?.applications?.filter((a) => a.alerts.some((x) => x.includes('overdue'))).length ?? '—'} note="Requires attention" symbol="!" />
-                <Stat label="Document expiry alerts" value={monitoring?.applications?.filter((a) => a.alerts.some((x) => x.includes('Document'))).length ?? '—'} note="Check validity" symbol="◷" />
+                <Stat label="Overdue deadlines" value={monitoring ? overdueCount : '—'} note="Requires attention" symbol="!" />
+                <Stat label="Document expiry alerts" value={monitoring ? expiryCount : '—'} note="Check validity" symbol="◷" />
                 <Stat label="Audit events" value={auditEvents.length} note="Persisted event log" symbol="≡" />
               </div>
 
@@ -286,22 +518,41 @@ function App() {
                 <p className="muted">
                   {monitoring ? `Checked on ${monitoring.checked_on}. Set dates in an application's review panel.` : 'Loading compliance data...'}
                 </p>
-                {(monitoring?.applications || []).map((item) => (
-                  <div className="audit-row" key={item.id}>
-                    <div className="audit-icon">{item.alerts.length ? '!' : '✓'}</div>
-                    <div>
-                      <strong>{item.institution}</strong>
-                      <p>{item.id} · {item.stage}</p>
-                      <span>
-                        Deadline: {item.due_date || 'Not set'} · Document expiry: {item.document_expiry_date || 'Not set'}
-                      </span>
-                      <p>{item.alerts.length ? item.alerts.join(' · ') : 'No configured date alerts'}</p>
-                      <button className="secondary-button" onClick={() => { setSelectedId(item.id); setPage('Applications') }}>
-                        Configure dates
-                      </button>
+
+                {(monitoring?.applications || []).map((item) => {
+                  const alerts = (item.alerts || []).map((alert) =>
+                    typeof alert === 'string'
+                      ? { severity: 'Warning', type: 'general', message: alert }
+                      : alert
+                  )
+
+                  return (
+                    <div className="audit-row" key={item.id}>
+                      <div className="audit-icon">{alerts.length ? '!' : '✓'}</div>
+                      <div>
+                        <strong>{item.institution}</strong>
+                        <p>{item.id} · {item.stage}</p>
+                        <span>
+                          Deadline: {item.due_date || 'Not set'} · Document expiry: {item.document_expiry_date || 'Not set'}
+                        </span>
+
+                        {alerts.length ? alerts.map((alert, index) => (
+                          <p key={`${item.id}-${index}`}>
+                            <strong>{alert.severity || 'Info'}:</strong> {alert.message || alert.type || 'Compliance alert'}
+                          </p>
+                        )) : <p>No configured date alerts</p>}
+
+                        <button className="secondary-button" onClick={() => { setSelectedId(item.id); setPage('Applications') }}>
+                          View application
+                        </button>
+                      </div>
                     </div>
-                  </div>
-                ))}
+                  )
+                })}
+
+                {allAlerts.length > 0 && (
+                  <p className="muted">Total alerts: {allAlerts.length}</p>
+                )}
               </div>
             </>
           )}
@@ -310,13 +561,11 @@ function App() {
             <div className="panel">
               <div className="section-heading">
                 <div><h2>Persistent audit trail</h2><p>Events loaded from the backend database.</p></div>
-                <button className="secondary-button" onClick={() => refreshData().catch((e) => setNotice(e.message))}>Refresh</button>
+                <button className="secondary-button" onClick={() => refreshData().catch((error) => setNotice(error.message))}>Refresh</button>
               </div>
 
               {auditEvents.length === 0 ? (
-                <div className="empty-state">
-                  No new audit events yet. Advance, return, or update compliance dates on an application to record activity.
-                </div>
+                <div className="empty-state">No audit events are available yet.</div>
               ) : [...auditEvents].map((event) => (
                 <div className="audit-row" key={event.id}>
                   <div className="audit-icon">↻</div>
@@ -324,6 +573,7 @@ function App() {
                     <strong>{event.action}</strong>
                     <p>{event.application_id} · {event.stage || '—'}</p>
                     <span>{event.timestamp ? new Date(event.timestamp).toLocaleString() : 'Timestamp unavailable'}</span>
+                    {event.actor && <p>Actor: {event.actor}</p>}
                     {event.details && <p>{event.details}</p>}
                   </div>
                 </div>
@@ -339,8 +589,8 @@ function App() {
       </main>
 
       {selected && (
-        <div className="detail-overlay" onMouseDown={(e) => {
-          if (e.target === e.currentTarget) setSelectedId('')
+        <div className="detail-overlay" onMouseDown={(event) => {
+          if (event.target === event.currentTarget) setSelectedId('')
         }}>
           <section className="detail-panel" aria-label="Application details">
             <div className="detail-header">
@@ -368,6 +618,7 @@ function App() {
               {(() => {
                 const route = workflows[selected.workflow_route] || FALLBACK_STAGES
                 const currentIndex = route.indexOf(selected.stage)
+
                 return route.map((stage, index) => (
                   <div className={`workflow-step ${index <= currentIndex ? 'step-done' : ''}`} key={stage}>
                     <div className="step-marker">{index < currentIndex ? '✓' : index + 1}</div>
@@ -380,29 +631,48 @@ function App() {
               })()}
             </div>
 
-            <div className="panel" style={{ marginTop: 16 }}>
-              <h3>Workflow configuration</h3>
-              <label htmlFor="workflow-route">Workflow route</label>
-              <select
-                id="workflow-route"
-                value={selected.workflow_route || 'STANDARD'}
-                disabled={busy || selected.stage === 'Completed' || selected.status === 'Approved'}
-                onChange={(e) => changeWorkflow(e.target.value)}
-              >
-                {Object.keys(workflows).map((route) => <option key={route} value={route}>{route}</option>)}
-              </select>
-              <p className="muted">A route can only be assigned when the current stage exists in it.</p>
-            </div>
+            {canEditWorkflow && (
+              <div className="panel" style={{ marginTop: 16 }}>
+                <h3>Workflow configuration</h3>
+                <label htmlFor="workflow-route">Workflow route</label>
+                <select
+                  id="workflow-route"
+                  value={selected.workflow_route || 'STANDARD'}
+                  disabled={busy || selected.stage === 'Completed' || selected.status === 'Approved'}
+                  onChange={(event) => changeWorkflow(event.target.value)}
+                >
+                  {Object.keys(workflows).map((route) => <option key={route} value={route}>{route}</option>)}
+                </select>
+                <p className="muted">Only Admin can change the workflow route.</p>
+              </div>
+            )}
 
             <div className="panel" style={{ marginTop: 16 }}>
               <h3>Compliance dates</h3>
               <label htmlFor="due-date">Application deadline</label>
-              <input id="due-date" type="date" value={dueDate} onChange={(e) => setDueDate(e.target.value)} />
+              <input
+                id="due-date"
+                type="date"
+                value={dueDate}
+                disabled={!canProcess || busy}
+                onChange={(event) => setDueDate(event.target.value)}
+              />
+
               <label htmlFor="expiry-date">Document expiry date</label>
-              <input id="expiry-date" type="date" value={expiryDate} onChange={(e) => setExpiryDate(e.target.value)} />
-              <button className="primary-button" disabled={busy} onClick={saveCompliance}>
-                {busy ? 'Saving...' : 'Save compliance dates'}
-              </button>
+              <input
+                id="expiry-date"
+                type="date"
+                value={expiryDate}
+                disabled={!canProcess || busy}
+                onChange={(event) => setExpiryDate(event.target.value)}
+              />
+
+              {canProcess && (
+                <button className="primary-button" disabled={busy} onClick={saveCompliance}>
+                  {busy ? 'Saving...' : 'Save compliance dates'}
+                </button>
+              )}
+              {!canProcess && <p className="muted">Viewer access is read-only.</p>}
             </div>
 
             <div className="workflow-section">
@@ -415,16 +685,23 @@ function App() {
                   <div>
                     <strong>{event.action}</strong>
                     <p>{event.details || event.stage}</p>
+                    {event.actor && <p>Actor: {event.actor}</p>}
                     <span>{event.timestamp ? new Date(event.timestamp).toLocaleString() : ''}</span>
                   </div>
                 </div>
               ))}
             </div>
 
-            {showReturn && (
+            {canProcess && showReturn && (
               <div className="return-form">
                 <label htmlFor="return-reason">Reason for returning application *</label>
-                <textarea id="return-reason" value={returnReason} onChange={(e) => setReturnReason(e.target.value)} placeholder="Explain what needs correction..." rows={3} />
+                <textarea
+                  id="return-reason"
+                  value={returnReason}
+                  onChange={(event) => setReturnReason(event.target.value)}
+                  placeholder="Explain what needs correction..."
+                  rows={3}
+                />
                 <div className="form-actions">
                   <button className="secondary-button" onClick={() => { setShowReturn(false); setReturnReason('') }}>Cancel</button>
                   <button className="danger-button" disabled={!returnReason.trim() || busy} onClick={() => performAction('return', returnReason.trim())}>Confirm return</button>
@@ -432,19 +709,27 @@ function App() {
               </div>
             )}
 
-            {!showReturn && (
+            {canProcess && !showReturn && (
               <div className="detail-actions">
-                <button className="secondary-button" disabled={busy || selected.stage === 'Completed' || selected.status === 'Approved' || selected.status === 'Returned'} onClick={() => setShowReturn(true)}>
+                <button
+                  className="secondary-button"
+                  disabled={busy || selected.stage === 'Completed' || selected.status === 'Approved' || selected.status === 'Returned'}
+                  onClick={() => setShowReturn(true)}
+                >
                   Return application
                 </button>
-                <button className="primary-button" disabled={busy || selected.stage === 'Completed' || selected.status === 'Approved'} onClick={() => performAction('advance')}>
+                <button
+                  className="primary-button"
+                  disabled={busy || selected.stage === 'Completed' || selected.status === 'Approved'}
+                  onClick={() => performAction('advance')}
+                >
                   {busy ? 'Processing...' : selected.stage === 'Final Approval' ? 'Approve & complete' : 'Complete stage →'}
                 </button>
               </div>
             )}
 
             <p className="prototype-note">
-              Prototype environment. Workflow changes and configured dates are stored in SQLite. Role-based authentication is not yet implemented.
+              Demo authentication is enabled. Admin can configure workflows; Admin and Officer can process applications; Viewer is read-only.
             </p>
           </section>
         </div>
@@ -477,9 +762,9 @@ function ApplicationFilters({ search, setSearch, filter, setFilter }) {
     <div className="filters">
       <div className="search-box">
         <span>⌕</span>
-        <input value={search} onChange={(e) => setSearch(e.target.value)} placeholder="Search ID, institution, officer..." />
+        <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ID, institution, officer..." />
       </div>
-      <select value={filter} onChange={(e) => setFilter(e.target.value)} aria-label="Filter by status">
+      <select value={filter} onChange={(event) => setFilter(event.target.value)} aria-label="Filter by status">
         {['All', 'Pending', 'Under Review', 'Approved', 'Returned'].map((status) => (
           <option key={status} value={status}>{status === 'All' ? 'All statuses' : status}</option>
         ))}

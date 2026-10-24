@@ -5,3 +5,7 @@ venv/
 node_modules/
 dist/
 .env
+
+# Local prototype backups
+backend/main.py.backup
+backend/aicte_before_auth.db
