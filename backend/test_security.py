@@ -48,6 +48,7 @@ class RoleBasedAccessTests(unittest.TestCase):
             "/api/applications/AICTE-2026-1001/history",
             "/api/audit",
             "/api/monitoring",
+            "/api/reports/pendency.csv",
         ]
 
         for endpoint in endpoints:
@@ -63,6 +64,7 @@ class RoleBasedAccessTests(unittest.TestCase):
             "/api/applications/AICTE-2026-1001/history",
             "/api/audit",
             "/api/monitoring",
+            "/api/reports/pendency.csv",
         ]
 
         for username in ("admin", "officer", "viewer"):

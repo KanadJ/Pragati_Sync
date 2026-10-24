@@ -93,10 +93,11 @@ The upcoming display window is configured by
 `evc_tracking.upcoming_window_days` in `backend/compliance_settings.json` (30
 days in the demo configuration). A scheduled visit with a past date is
 reported as `Delayed` when the tracking list is fetched; this is derived from
-the date and does not run a reminder or escalation job. The application may
-reschedule delayed cases. The configured window is a demo usability setting,
-not an official AICTE processing deadline. No background reminders,
-escalations, or automated EVC scheduling are implemented.
+the date. The periodic compliance checker also creates deduplicated reminders
+for configured EVC lead windows and overdue scheduled dates; it does not
+automatically schedule or reschedule visits. The application may reschedule
+delayed cases. The configured window is a demo usability setting, not an
+official AICTE processing deadline.
 
 ## Explainable workflow risk assessment
 
@@ -136,6 +137,30 @@ of safety. If no factor can be assessed, the score is `null` and level is
 submission date is substituted when that audit evidence is absent. The
 default weights, bands, and point values are demo policy and should be
 reviewed for the intended workflow before operational use.
+
+## Pendency report and CSV export
+
+Authenticated Admin, Officer, and Viewer roles can download
+`GET /api/reports/pendency.csv` from the Monitoring page. The report includes
+application identity, institution, assigned officer, status, workflow stage,
+deadline state and relevant day counts, the valid current-stage audit entry
+timestamp and pending duration when available, prototype risk score/level,
+prototype document compliance summary, document verification/renewal states,
+and active overdue-notification counts/escalation level.
+
+Deadline states distinguish `Overdue`, `Due today`, `Upcoming`, `Completed`,
+`Not set`, and `Unknown` for invalid dates. Completed applications are not
+labelled actively overdue. Pending duration is calculated from the matching
+current-stage audit timestamp; if no reliable timestamp exists it is reported
+as `Unknown`. Dates use the Asia/Kolkata calendar. CSV cells are serialized
+with Python's CSV writer and formula-like values, including values preceded by
+whitespace/control characters, are neutralized.
+
+Risk and compliance columns are configurable prototype assessments and are
+not verified official AICTE/APH compliance determinations. The report does not
+invent missing due dates, stage timestamps, document statuses, or escalation
+records. It is read-only and uses existing SQLite data; it introduces no
+schema changes.
 
 ## Document register and compliance notifications
 

@@ -1,3 +1,5 @@
+import csv
+import io
 import json
 import tempfile
 import unittest
@@ -182,6 +184,245 @@ class WorkflowAutomationTests(unittest.TestCase):
         self.assertEqual(dashboard["by_region"], {})
         self.assertEqual(dashboard["by_officer"], {})
         self.assertEqual(dashboard["by_stage"], {})
+
+    def test_pendency_report_deadline_boundaries_completion_and_stage_duration(self):
+        today = date(2026, 10, 24)
+        self.add_application(
+            "PENDENCY-OVERDUE",
+            institution="Overdue Institute",
+            officer="Officer One",
+            stage="Application Review",
+            status="Under Review",
+            due_date=(today - timedelta(days=2)).isoformat(),
+        )
+        self.add_application(
+            "PENDENCY-TODAY",
+            stage="Document Verification",
+            status="Under Review",
+            due_date=today.isoformat(),
+        )
+        self.add_application(
+            "PENDENCY-UPCOMING",
+            due_date=(today + timedelta(days=5)).isoformat(),
+        )
+        self.add_application(
+            "PENDENCY-COMPLETED",
+            stage="Completed",
+            status="Approved",
+            due_date=(today - timedelta(days=10)).isoformat(),
+        )
+        self.add_application(
+            "PENDENCY-INVALID",
+            due_date="not-a-date",
+        )
+        self.add_application(
+            "PENDENCY-MISSING",
+            due_date=None,
+        )
+        self.add_application(
+            "PENDENCY-BAD-STAGE-TIME",
+            due_date=(today + timedelta(days=20)).isoformat(),
+        )
+        with main.connect_db() as connection:
+            connection.executemany("""
+                INSERT INTO audit_events
+                    (application_id, action, stage, details, timestamp, actor)
+                VALUES (?, 'Stage advanced', ?, ?, ?, ?)
+            """, [
+                (
+                    "PENDENCY-OVERDUE",
+                    "Application Review",
+                    "Entered current stage",
+                    "2026-10-20T12:00:00+00:00",
+                    "officer",
+                ),
+                (
+                    "PENDENCY-BAD-STAGE-TIME",
+                    "Application Review",
+                    "Invalid timestamp",
+                    "not-a-timestamp",
+                    "officer",
+                ),
+            ])
+
+        headers = self.login("viewer")
+        with patch("main.local_date", return_value=today):
+            response = self.client.get("/api/reports/pendency.csv", headers=headers)
+            monitoring = self.client.get("/api/monitoring", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.headers["content-type"], "text/csv; charset=utf-8")
+        self.assertIn("attachment; filename=\"pendency-report.csv\"", response.headers["content-disposition"])
+        rows = {
+            row["Application ID"]: row
+            for row in csv.DictReader(io.StringIO(response.text))
+        }
+        self.assertIn(
+            "Prototype Compliance State (Not Official APH Determination)",
+            rows["PENDENCY-OVERDUE"],
+        )
+        overdue = rows["PENDENCY-OVERDUE"]
+        self.assertEqual(overdue["Deadline State"], "Overdue")
+        self.assertEqual(overdue["Days Overdue"], "2")
+        self.assertEqual(overdue["Days Until Deadline"], "")
+        self.assertEqual(
+            overdue["Current Stage Entered At (Asia/Kolkata)"],
+            "2026-10-20T17:30:00+05:30",
+        )
+        self.assertEqual(overdue["Pending Duration (Days)"], "4")
+        self.assertEqual(rows["PENDENCY-TODAY"]["Deadline State"], "Due today")
+        self.assertEqual(rows["PENDENCY-TODAY"]["Days Until Deadline"], "0")
+        self.assertEqual(rows["PENDENCY-UPCOMING"]["Deadline State"], "Upcoming")
+        self.assertEqual(rows["PENDENCY-UPCOMING"]["Days Until Deadline"], "5")
+        self.assertEqual(rows["PENDENCY-COMPLETED"]["Deadline State"], "Completed")
+        self.assertEqual(rows["PENDENCY-COMPLETED"]["Days Overdue"], "")
+        self.assertEqual(rows["PENDENCY-INVALID"]["Deadline State"], "Unknown")
+        self.assertEqual(rows["PENDENCY-INVALID"]["Pending Duration (Days)"], "Unknown")
+        self.assertEqual(rows["PENDENCY-MISSING"]["Deadline State"], "Not set")
+        self.assertEqual(rows["PENDENCY-MISSING"]["Deadline"], "Not set")
+        self.assertEqual(rows["PENDENCY-MISSING"]["Current Stage Entered At (Asia/Kolkata)"], "Unknown")
+        self.assertEqual(rows["PENDENCY-MISSING"]["Pending Duration (Days)"], "Unknown")
+        self.assertEqual(
+            rows["PENDENCY-BAD-STAGE-TIME"]["Current Stage Entered At (Asia/Kolkata)"],
+            "Unknown",
+        )
+        self.assertEqual(
+            rows["PENDENCY-BAD-STAGE-TIME"]["Pending Duration (Days)"],
+            "Unknown",
+        )
+
+        monitoring_by_id = {
+            item["id"]: item for item in monitoring.json()["applications"]
+        }
+        self.assertTrue(any(
+            alert["type"] == "Overdue"
+            for alert in monitoring_by_id["PENDENCY-OVERDUE"]["alerts"]
+        ))
+        self.assertFalse(any(
+            alert["type"] == "Overdue"
+            for alert in monitoring_by_id["PENDENCY-COMPLETED"]["alerts"]
+        ))
+        self.assertEqual(
+            overdue["Prototype Risk Score"],
+            str(monitoring_by_id["PENDENCY-OVERDUE"]["risk_score"]),
+        )
+        self.assertEqual(
+            overdue["Prototype Risk Level"],
+            monitoring_by_id["PENDENCY-OVERDUE"]["risk_level"],
+        )
+
+    def test_pendency_report_includes_document_and_active_escalation_data(self):
+        today = date(2026, 10, 24)
+        application = self.add_application(
+            "PENDENCY-DOCUMENT",
+            stage="Document Verification",
+            status="Under Review",
+            due_date=(today - timedelta(days=1)).isoformat(),
+        )
+        with main.connect_db() as connection:
+            connection.execute("""
+                INSERT INTO documents
+                    (application_id, document_type, name, status, expiry_date,
+                     renewal_status, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                application["id"],
+                "Lease",
+                "Current lease",
+                "Submitted",
+                None,
+                "Submitted",
+                "2026-10-20T00:00:00+00:00",
+                "2026-10-20T00:00:00+00:00",
+            ))
+            connection.execute("""
+                INSERT INTO notifications
+                    (application_id, category, message, created_at, escalation_level, dedupe_key)
+                VALUES (?, 'application_overdue', ?, ?, ?, ?)
+            """, (
+                application["id"],
+                "Deadline passed",
+                "2026-10-23T12:00:00+00:00",
+                2,
+                "test-active-overdue-notification",
+            ))
+            connection.execute("""
+                INSERT INTO notifications
+                    (application_id, category, message, created_at, escalation_level,
+                     dedupe_key, resolved_at)
+                VALUES (?, 'application_overdue', ?, ?, ?, ?, ?)
+            """, (
+                application["id"],
+                "Previously resolved deadline",
+                "2026-10-20T12:00:00+00:00",
+                5,
+                "test-resolved-overdue-notification",
+                "2026-10-22T12:00:00+00:00",
+            ))
+
+        headers = self.login("viewer")
+        with patch("main.local_date", return_value=today):
+            response = self.client.get("/api/reports/pendency.csv", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        row = next(
+            item
+            for item in csv.DictReader(io.StringIO(response.text))
+            if item["Application ID"] == application["id"]
+        )
+        self.assertEqual(row["Document Count"], "1")
+        self.assertIn("Lease: Submitted (renewal: Submitted)", row["Document Statuses"])
+        self.assertEqual(row["Active Overdue Notifications"], "1")
+        self.assertEqual(row["Active Overdue Escalation Level"], "2")
+        self.assertEqual(
+            row["Prototype Compliance State (Not Official APH Determination)"],
+            "Pending Verification",
+        )
+
+    def test_pendency_report_empty_results_and_formula_injection_safety(self):
+        headers = self.login("viewer")
+        with main.connect_db() as connection:
+            connection.execute("DELETE FROM applications")
+        empty_response = self.client.get(
+            "/api/reports/pendency.csv",
+            headers=headers,
+        )
+        self.assertEqual(empty_response.status_code, 200)
+        empty_rows = list(csv.reader(io.StringIO(empty_response.text)))
+        self.assertGreater(len(empty_rows[0]), 0)
+        self.assertEqual(len(empty_rows), 1)
+
+        self.add_application(
+            "=2+2",
+            institution=" \t=HYPERLINK(\"https://example.invalid\")",
+            officer="\x00+SUM(1,1)",
+        )
+        self.add_application(
+            "SAFE-CSV",
+            institution='Ordinary, "quoted" institution',
+            officer="Normal officer",
+        )
+        self.add_application(
+            "FORMAT-CSV",
+            institution="\ufeff@SUM(1,1)",
+        )
+        response = self.client.get("/api/reports/pendency.csv", headers=headers)
+        self.assertEqual(response.status_code, 200)
+        rows = {
+            row["Application ID"]: row
+            for row in csv.DictReader(io.StringIO(response.text))
+        }
+        self.assertIn("'=2+2", rows)
+        self.assertEqual(
+            rows["'=2+2"]["Institution"],
+            "' \t=HYPERLINK(\"https://example.invalid\")",
+        )
+        self.assertEqual(rows["'=2+2"]["Assigned Officer"], "'\x00+SUM(1,1)")
+        self.assertEqual(
+            rows["SAFE-CSV"]["Institution"],
+            'Ordinary, "quoted" institution',
+        )
+        self.assertEqual(rows["SAFE-CSV"]["Assigned Officer"], "Normal officer")
+        self.assertEqual(rows["FORMAT-CSV"]["Institution"], "'\ufeff@SUM(1,1)")
 
     def test_workflow_risk_deadline_bands_overdue_cap_and_recommendations(self):
         settings = main.get_compliance_settings()

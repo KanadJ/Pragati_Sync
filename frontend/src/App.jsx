@@ -55,6 +55,7 @@ function App() {
   })
   const [loading, setLoading] = useState(true)
   const [busy, setBusy] = useState(false)
+  const [reportBusy, setReportBusy] = useState(false)
   const [selectedId, setSelectedId] = useState('')
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('All')
@@ -84,19 +85,22 @@ function App() {
 
   const request = useCallback(async (path, options = {}) => {
     const currentToken = token || localStorage.getItem(TOKEN_KEY)
+    const { responseType, ...requestOptions } = options
 
     const response = await fetch(`${API}${path}`, {
-      ...options,
+      ...requestOptions,
       headers: {
-        ...(options.body ? { 'Content-Type': 'application/json' } : {}),
+        ...(requestOptions.body ? { 'Content-Type': 'application/json' } : {}),
         ...(currentToken
           ? { Authorization: `Bearer ${currentToken}` }
           : {}),
-        ...options.headers,
+        ...requestOptions.headers,
       },
     })
 
-    const data = await response.json().catch(() => ({}))
+    const data = responseType === 'blob'
+      ? await response.blob()
+      : await response.json().catch(() => ({}))
 
     if (response.status === 401 && path !== '/api/auth/login') {
       localStorage.removeItem(TOKEN_KEY)
@@ -106,13 +110,19 @@ function App() {
     }
 
     if (!response.ok) {
+      const errorData = data instanceof Blob
+        ? await data.text().then((text) => JSON.parse(text)).catch(() => ({}))
+        : data
       throw new Error(
-        typeof data.detail === 'string'
-          ? data.detail
+        errorData && typeof errorData.detail === 'string'
+          ? errorData.detail
           : `Request failed (${response.status})`
       )
     }
 
+    if (responseType === 'blob') {
+      return { data, headers: response.headers }
+    }
     return data
   }, [token])
 
@@ -607,6 +617,30 @@ function App() {
     }
   }
 
+  async function exportPendencyReport() {
+    if (reportBusy) return
+    setReportBusy(true)
+    setNotice('')
+    try {
+      const result = await request('/api/reports/pendency.csv', {
+        responseType: 'blob',
+      })
+      const objectUrl = URL.createObjectURL(result.data)
+      const link = document.createElement('a')
+      link.href = objectUrl
+      link.download = 'pendency-report.csv'
+      document.body.appendChild(link)
+      link.click()
+      link.remove()
+      window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0)
+      setNotice('Pendency report downloaded.')
+    } catch (error) {
+      setNotice(error.message)
+    } finally {
+      setReportBusy(false)
+    }
+  }
+
   async function createApplication(event) {
     event.preventDefault()
     if (!isAdmin || createBusy) return
@@ -979,7 +1013,12 @@ function App() {
               <div className="panel monitoring-panel">
                 <div className="section-heading">
                   <div><h2>Compliance and risk monitoring</h2><p>Configurable demo thresholds; this is an explainable rule-based assessment, not machine learning or an official AICTE determination.</p></div>
-                  {isAdmin && <button className="secondary-button" disabled={busy} onClick={runComplianceCheck}>Run compliance check</button>}
+                  <div className="form-actions">
+                    <button className="secondary-button" disabled={reportBusy} onClick={exportPendencyReport}>
+                      {reportBusy ? 'Exporting...' : 'Export Pendency Report'}
+                    </button>
+                    {isAdmin && <button className="secondary-button" disabled={busy} onClick={runComplianceCheck}>Run compliance check</button>}
+                  </div>
                 </div>
                 <p className="muted">
                   {monitoring ? `Checked on ${monitoring.checked_on}. Set dates in an application's review panel.` : 'Loading compliance data...'}

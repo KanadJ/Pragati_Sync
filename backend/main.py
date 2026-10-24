@@ -1,12 +1,15 @@
 
 import asyncio
+import csv
 import hashlib
 import hmac
+import io
 import json
 import logging
 import os
 import secrets
 import sqlite3
+import unicodedata
 from contextlib import contextmanager
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -14,7 +17,7 @@ from threading import Lock
 from urllib.parse import urlsplit
 from zoneinfo import ZoneInfo
 
-from fastapi import Body, Depends, FastAPI, Header, HTTPException
+from fastapi import Body, Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 
@@ -2469,6 +2472,166 @@ def compliance_monitoring(user=Depends(get_current_user)):
         "risk_summary": risk_summary,
         "applications": results,
     }
+
+
+def safe_csv_cell(value):
+    if value is None:
+        return ""
+    text = str(value)
+    first_value_character = next(
+        (
+            character
+            for character in text
+            if not character.isspace()
+            and unicodedata.category(character) not in {"Cc", "Cf"}
+        ),
+        "",
+    )
+    if first_value_character in {"=", "+", "-", "@"}:
+        return "'" + text
+    return text
+
+
+@app.get("/api/reports/pendency.csv")
+def export_pendency_report(user=Depends(get_current_user)):
+    today = local_date()
+    settings = get_compliance_settings()
+    stage_entries = get_stage_entry_timestamps()
+    applications = get_all_applications()
+
+    with connect_db() as connection:
+        active_overdue_notifications = {
+            row["application_id"]: dict(row)
+            for row in connection.execute("""
+                SELECT application_id, COUNT(*) AS notification_count,
+                       MAX(escalation_level) AS escalation_level
+                FROM notifications
+                WHERE category = 'application_overdue' AND resolved_at IS NULL
+                GROUP BY application_id
+            """).fetchall()
+        }
+
+    headers = [
+        "Application ID",
+        "Institution",
+        "Assigned Officer",
+        "Application Status",
+        "Workflow Stage",
+        "Deadline",
+        "Deadline State",
+        "Days Overdue",
+        "Days Until Deadline",
+        "Current Stage Entered At (Asia/Kolkata)",
+        "Pending Duration (Days)",
+        "Prototype Risk Score",
+        "Prototype Risk Level",
+        "Prototype Compliance State (Not Official APH Determination)",
+        "Document Count",
+        "Document Statuses",
+        "Active Overdue Notifications",
+        "Active Overdue Escalation Level",
+    ]
+    output = io.StringIO(newline="")
+    writer = csv.writer(output, lineterminator="\r\n")
+    writer.writerow(headers)
+
+    for application in applications:
+        application_id = application["id"]
+        stage = application.get("stage")
+        due_value = application.get("due_date")
+        due = parse_date(due_value)
+        completed = is_completed(application)
+
+        days_overdue = ""
+        days_until_deadline = ""
+        if completed:
+            deadline_state = "Completed"
+        elif due_value in (None, ""):
+            deadline_state = "Not set"
+        elif due is None:
+            deadline_state = "Unknown"
+        elif due < today:
+            deadline_state = "Overdue"
+            days_overdue = (today - due).days
+        elif due == today:
+            deadline_state = "Due today"
+            days_until_deadline = 0
+        else:
+            deadline_state = "Upcoming"
+            days_until_deadline = (due - today).days
+
+        stage_entry = stage_entries.get((application_id, stage))
+        if stage_entry is None:
+            stage_entry_text = "Unknown"
+            pending_duration = "Not pending" if completed else "Unknown"
+        else:
+            stage_entry_local = stage_entry.astimezone(KOLKATA_TIMEZONE)
+            stage_entry_text = stage_entry_local.isoformat(timespec="seconds")
+            if completed:
+                pending_duration = "Not pending"
+            elif stage_entry_local.date() > today:
+                stage_entry_text = "Unknown"
+                pending_duration = "Unknown"
+            else:
+                pending_duration = (today - stage_entry_local.date()).days
+
+        documents = list_application_documents(application_id)
+        compliance = calculate_compliance_summary(documents, settings, today)
+        risk = calculate_workflow_risk(
+            application,
+            documents,
+            settings,
+            stage_entry,
+            today,
+        )
+        if documents:
+            document_statuses = "; ".join(
+                f"{document.get('document_type') or 'Unknown'}: "
+                f"{document.get('status') or 'Unknown'} "
+                f"(renewal: {document.get('renewal_status') or 'Unknown'})"
+                for document in documents
+            )
+        else:
+            document_statuses = "No documents recorded"
+
+        overdue_notification = active_overdue_notifications.get(application_id)
+        notification_count = (
+            overdue_notification["notification_count"]
+            if overdue_notification
+            else "None"
+        )
+        escalation_level = (
+            overdue_notification["escalation_level"]
+            if overdue_notification
+            else "None"
+        )
+        row = [
+            application_id,
+            application.get("institution") or "Unknown",
+            application.get("officer") or "Unknown",
+            application.get("status") or "Unknown",
+            stage or "Unknown",
+            due_value or "Not set",
+            deadline_state,
+            days_overdue,
+            days_until_deadline,
+            stage_entry_text,
+            pending_duration,
+            risk["risk_score"] if risk["risk_score"] is not None else "Unknown",
+            risk["risk_level"] or "Unknown",
+            compliance["state"] or "Unknown",
+            compliance["document_count"],
+            document_statuses,
+            notification_count,
+            escalation_level,
+        ]
+        writer.writerow([safe_csv_cell(value) for value in row])
+
+    return Response(
+        content=output.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="pendency-report.csv"'},
+    )
 
 
 @app.post("/api/applications/{application_id}/workflow")
