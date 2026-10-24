@@ -1,7 +1,7 @@
 import json
 import tempfile
 import unittest
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
 from fastapi.testclient import TestClient
@@ -546,6 +546,228 @@ class DocumentComplianceTests(unittest.TestCase):
                 (notification["id"],),
             ).fetchone()["escalation_level"]
         self.assertEqual(level, 1)
+
+    def test_deadline_reminder_windows_deduplicate_and_resolve_when_date_changes(self):
+        today = date(2026, 10, 24)
+        for days_remaining, expected_interval in (
+            (8, None),
+            (7, 7),
+            (4, 7),
+            (3, 3),
+            (2, 3),
+            (1, 1),
+            (0, None),
+        ):
+            with self.subTest(days_remaining=days_remaining):
+                self.assertEqual(
+                    main.reminder_interval(days_remaining, [1, 3, 7]),
+                    expected_interval,
+                )
+        application = self.add_application(
+            "REMINDER-1",
+            due_date=(today + timedelta(days=8)).isoformat(),
+        )
+        check_time = datetime(2026, 10, 24, 6, tzinfo=timezone.utc)
+
+        self.assertEqual(
+            main.run_compliance_check(as_of=today, now=check_time)["created"],
+            0,
+        )
+        application["due_date"] = (today + timedelta(days=7)).isoformat()
+        with main.connect_db() as connection:
+            connection.execute(
+                "UPDATE applications SET data = ? WHERE id = ?",
+                (json.dumps(application), application["id"]),
+            )
+
+        first = main.run_compliance_check(as_of=today, now=check_time)
+        self.assertEqual(first["created"], 1)
+        self.assertEqual(main.run_compliance_check(as_of=today, now=check_time)["created"], 0)
+        with main.connect_db() as connection:
+            reminder = connection.execute(
+                "SELECT * FROM notifications WHERE application_id = ?",
+                (application["id"],),
+            ).fetchone()
+        self.assertEqual(reminder["category"], "application_deadline_reminder")
+        self.assertIn(":7", reminder["dedupe_key"])
+
+        application["due_date"] = (today + timedelta(days=2)).isoformat()
+        with main.connect_db() as connection:
+            connection.execute(
+                "UPDATE applications SET data = ? WHERE id = ?",
+                (json.dumps(application), application["id"]),
+            )
+        changed = main.run_compliance_check(
+            as_of=today,
+            now=check_time + timedelta(days=5),
+        )
+        self.assertEqual(changed["created"], 1)
+        with main.connect_db() as connection:
+            notifications = connection.execute(
+                "SELECT category, dedupe_key, resolved_at FROM notifications WHERE application_id = ?",
+                (application["id"],),
+            ).fetchall()
+        self.assertEqual(len(notifications), 2)
+        self.assertIsNotNone(notifications[0]["resolved_at"])
+        self.assertIsNone(notifications[1]["resolved_at"])
+        self.assertIn(":3", notifications[1]["dedupe_key"])
+
+    def test_overdue_escalation_thresholds_and_audit_events_are_idempotent(self):
+        application = self.add_application(
+            "OVERDUE-ESCALATION",
+            due_date="2026-09-30",
+        )
+        first_time = datetime(2026, 10, 1, 6, tzinfo=timezone.utc)
+        created = main.run_compliance_check(
+            as_of=date(2026, 10, 1),
+            now=first_time,
+        )
+        self.assertEqual(created["created"], 1)
+
+        at_first_threshold = datetime(2026, 10, 4, 6, tzinfo=timezone.utc)
+        first_escalation = main.run_compliance_check(
+            as_of=date(2026, 10, 4),
+            now=at_first_threshold,
+        )
+        self.assertEqual(first_escalation["escalated"], 1)
+        self.assertEqual(
+            main.run_compliance_check(
+                as_of=date(2026, 10, 4),
+                now=at_first_threshold,
+            )["escalated"],
+            0,
+        )
+        second_escalation = main.run_compliance_check(
+            as_of=date(2026, 10, 8),
+            now=datetime(2026, 10, 8, 6, tzinfo=timezone.utc),
+        )
+        self.assertEqual(second_escalation["escalated"], 1)
+        with main.connect_db() as connection:
+            notification = connection.execute(
+                "SELECT escalation_level FROM notifications WHERE application_id = ?",
+                (application["id"],),
+            ).fetchone()
+            audit = connection.execute(
+                """
+                SELECT COUNT(*) FROM audit_events
+                WHERE application_id = ? AND action = 'Notification escalated'
+                """,
+                (application["id"],),
+            ).fetchone()[0]
+        self.assertEqual(notification["escalation_level"], 2)
+        self.assertEqual(audit, 2)
+
+    def test_evc_reminders_and_overdue_events_resolve_after_reschedule(self):
+        today = main.local_date()
+        application = self.add_application(
+            "EVC-REMINDER",
+            workflow_route="SCRUTINY_EVC",
+            stage="EVC",
+        )
+        officer = self.login("officer")
+        endpoint = f"/api/applications/{application['id']}/evc/schedule"
+        first_schedule = self.client.post(
+            endpoint,
+            headers=officer,
+            json={"scheduled_date": (today + timedelta(days=7)).isoformat()},
+        )
+        self.assertEqual(first_schedule.status_code, 200)
+        rescheduled = self.client.post(
+            endpoint,
+            headers=officer,
+            json={"scheduled_date": (today + timedelta(days=2)).isoformat()},
+        )
+        self.assertEqual(rescheduled.status_code, 200)
+        overdue_schedule = self.client.post(
+            endpoint,
+            headers=officer,
+            json={"scheduled_date": (today - timedelta(days=1)).isoformat()},
+        )
+        self.assertEqual(overdue_schedule.status_code, 200)
+
+        with main.connect_db() as connection:
+            notifications = connection.execute(
+                "SELECT category, resolved_at FROM notifications WHERE application_id = ? ORDER BY id",
+                (application["id"],),
+            ).fetchall()
+        self.assertEqual(
+            [row["category"] for row in notifications],
+            [
+                "evc_scheduled_reminder",
+                "evc_scheduled_reminder",
+                "evc_overdue",
+            ],
+        )
+        self.assertIsNotNone(notifications[0]["resolved_at"])
+        self.assertIsNotNone(notifications[1]["resolved_at"])
+        self.assertIsNone(notifications[2]["resolved_at"])
+        completed = self.client.post(
+            f"/api/applications/{application['id']}/evc/complete",
+            headers=officer,
+            json={},
+        )
+        self.assertEqual(completed.status_code, 200)
+        with main.connect_db() as connection:
+            resolved_overdue = connection.execute(
+                "SELECT resolved_at FROM notifications WHERE category = 'evc_overdue' AND application_id = ?",
+                (application["id"],),
+            ).fetchone()["resolved_at"]
+        self.assertIsNotNone(resolved_overdue)
+
+    def test_timezone_date_boundary_and_restart_catch_up_are_idempotent(self):
+        self.assertEqual(
+            main.local_date(datetime(2026, 10, 24, 18, 30, tzinfo=timezone.utc)),
+            date(2026, 10, 25),
+        )
+        application = self.add_application(
+            "RESTART-CATCHUP",
+            due_date=(date.today() - timedelta(days=1)).isoformat(),
+        )
+        with main.connect_db() as connection:
+            connection.execute(
+                "UPDATE applications SET data = ? WHERE id = ?",
+                (json.dumps(application), application["id"]),
+            )
+
+        self.client.__exit__(None, None, None)
+        self.client = TestClient(main.app)
+        self.client.__enter__()
+        with main.connect_db() as connection:
+            notification_count = connection.execute(
+                "SELECT COUNT(*) FROM notifications WHERE application_id = ?",
+                (application["id"],),
+            ).fetchone()[0]
+            created_audit_count = connection.execute(
+                """
+                SELECT COUNT(*) FROM audit_events
+                WHERE application_id = ? AND action = 'Notification created'
+                """,
+                (application["id"],),
+            ).fetchone()[0]
+        self.assertEqual(notification_count, 1)
+        self.assertEqual(created_audit_count, 1)
+
+        self.client.__exit__(None, None, None)
+        self.client = TestClient(main.app)
+        self.client.__enter__()
+        with main.connect_db() as connection:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT COUNT(*) FROM notifications WHERE application_id = ?",
+                    (application["id"],),
+                ).fetchone()[0],
+                1,
+            )
+            self.assertEqual(
+                connection.execute(
+                    """
+                    SELECT COUNT(*) FROM audit_events
+                    WHERE application_id = ? AND action = 'Notification created'
+                    """,
+                    (application["id"],),
+                ).fetchone()[0],
+                1,
+            )
 
     def test_admin_only_triggers_compliance_check_and_overdue_notice_is_deduplicated(self):
         application = self.add_application(

@@ -1,7 +1,9 @@
 
+import asyncio
 import hashlib
 import hmac
 import json
+import logging
 import os
 import secrets
 import sqlite3
@@ -10,6 +12,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from threading import Lock
 from urllib.parse import urlsplit
+from zoneinfo import ZoneInfo
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -79,7 +82,18 @@ NOTIFICATION_CATEGORIES = {
     "document_expiring",
     "document_expired",
     "application_overdue",
+    "application_deadline_reminder",
+    "evc_scheduled_reminder",
+    "evc_overdue",
 }
+KOLKATA_TIMEZONE = ZoneInfo("Asia/Kolkata")
+DEFAULT_NOTIFICATION_SCHEDULE = {
+    "deadline_reminder_days": [1, 3, 7],
+    "evc_reminder_days": [1, 3, 7],
+    "check_interval_seconds": 3600,
+}
+LOGGER = logging.getLogger(__name__)
+COMPLIANCE_SCHEDULER_TASK = None
 
 DEFAULT_WORKFLOW_RISK_ASSESSMENT = {
     "factor_caps": {"deadline": 40, "stage_age": 25, "compliance": 35},
@@ -218,8 +232,31 @@ INITIAL_APPLICATIONS = [
 ]
 
 
-def now_iso():
-    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+def now_iso(now=None):
+    timestamp = normalize_datetime(now) if now is not None else datetime.now(timezone.utc)
+    return timestamp.isoformat(timespec="seconds")
+
+
+def normalize_datetime(value):
+    if not isinstance(value, datetime):
+        raise ValueError("now must be a datetime")
+    if value.tzinfo is None:
+        return value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc)
+
+
+def local_date(now=None):
+    timestamp = normalize_datetime(now) if now is not None else datetime.now(timezone.utc)
+    return timestamp.astimezone(KOLKATA_TIMEZONE).date()
+
+
+def reminder_interval(days_remaining, intervals):
+    for index in range(len(intervals) - 1, -1, -1):
+        lead_days = intervals[index]
+        lower_bound = intervals[index - 1] if index else 0
+        if lower_bound < days_remaining <= lead_days:
+            return lead_days
+    return None
 
 
 @contextmanager
@@ -425,6 +462,27 @@ def get_compliance_settings():
         or escalation_days != sorted(set(escalation_days))
     ):
         raise HTTPException(status_code=500, detail="Invalid compliance settings configuration")
+    schedule = settings.get("notification_schedule", DEFAULT_NOTIFICATION_SCHEDULE)
+    if (
+        not isinstance(schedule, dict)
+        or set(schedule) != set(DEFAULT_NOTIFICATION_SCHEDULE)
+        or any(
+            not isinstance(schedule[key], list)
+            or any(
+                not isinstance(value, int)
+                or isinstance(value, bool)
+                or value < 1
+                for value in schedule[key]
+            )
+            or schedule[key] != sorted(set(schedule[key]))
+            for key in ("deadline_reminder_days", "evc_reminder_days")
+        )
+        or not isinstance(schedule["check_interval_seconds"], int)
+        or isinstance(schedule["check_interval_seconds"], bool)
+        or schedule["check_interval_seconds"] < 1
+    ):
+        raise HTTPException(status_code=500, detail="Invalid notification schedule configuration")
+    settings["notification_schedule"] = schedule
     evc_settings = settings.get("evc_tracking", {"upcoming_window_days": 30})
     if (
         not isinstance(evc_settings, dict)
@@ -450,7 +508,7 @@ def application_requires_evc(application):
 
 
 def get_evc_status(record, today=None):
-    today = today or date.today()
+    today = today or local_date()
     if record["status"] == "Completed":
         return "Completed"
     scheduled_date = parse_date(record.get("scheduled_date"))
@@ -462,7 +520,7 @@ def get_evc_status(record, today=None):
 
 
 def list_evc_tracking(today=None):
-    today = today or date.today()
+    today = today or local_date()
     applications = get_all_applications()
     eligible = [app for app in applications if application_requires_evc(app)]
     if not eligible:
@@ -630,7 +688,7 @@ def list_application_documents(application_id):
 
 
 def get_document_tracking_status(document, settings, today=None):
-    today = today or date.today()
+    today = today or local_date()
     renewal_status = document.get("renewal_status", "Not Required")
     if renewal_status == "Submitted":
         return "Submitted for Renewal"
@@ -702,7 +760,7 @@ def calculate_workflow_risk(
     stage_entered_at=None,
     today=None,
 ):
-    today = today or date.today()
+    today = today or local_date()
     config = settings["workflow_risk_assessment"]
     caps = config["factor_caps"]
     factors = []
@@ -938,7 +996,7 @@ def calculate_workflow_risk(
 
 
 def calculate_compliance_summary(documents, settings, today=None):
-    today = today or date.today()
+    today = today or local_date()
     present_types = {
         document["document_type"].strip().casefold()
         for document in documents
@@ -1004,18 +1062,25 @@ def save_application(application):
         """, (application["id"], json.dumps(application)))
 
 
-def make_history_event(action, stage, details=None, actor="System"):
+def make_history_event(action, stage, details=None, actor="System", timestamp=None):
     return {
         "action": action,
         "stage": stage,
         "details": details,
-        "timestamp": now_iso(),
+        "timestamp": timestamp or now_iso(),
         "actor": actor,
     }
 
 
-def record_event(application, action, stage, details=None, actor="System"):
-    event = make_history_event(action, stage, details, actor)
+def record_event(
+    application,
+    action,
+    stage,
+    details=None,
+    actor="System",
+    timestamp=None,
+):
+    event = make_history_event(action, stage, details, actor, timestamp)
     application.setdefault("history", []).append(event)
 
     with connect_db() as connection:
@@ -1144,8 +1209,8 @@ def parse_date(value):
         return None
 
 
-def notification_event(application_id, category, message, dedupe_key, actor):
-    created_at = now_iso()
+def notification_event(application_id, category, message, dedupe_key, actor, now=None):
+    created_at = now_iso(now)
     with connect_db() as connection:
         cursor = connection.execute("""
             INSERT OR IGNORE INTO notifications
@@ -1159,17 +1224,18 @@ def notification_event(application_id, category, message, dedupe_key, actor):
                 (dedupe_key,),
             ).fetchone()
             if existing and existing["resolved_at"] is not None:
-                connection.execute("""
+                reactivated = connection.execute("""
                     UPDATE notifications
                     SET message = ?, created_at = ?, is_read = 0,
                         escalation_level = 0, resolved_at = NULL
-                    WHERE id = ?
+                    WHERE id = ? AND resolved_at IS NOT NULL
                 """, (message, created_at, existing["id"]))
-                connection.execute(
-                    "DELETE FROM notification_views WHERE notification_id = ?",
-                    (existing["id"],),
-                )
-                created = True
+                created = reactivated.rowcount == 1
+                if created:
+                    connection.execute(
+                        "DELETE FROM notification_views WHERE notification_id = ?",
+                        (existing["id"],),
+                    )
 
     if created:
         application = find_application(application_id)
@@ -1179,18 +1245,23 @@ def notification_event(application_id, category, message, dedupe_key, actor):
             application.get("stage"),
             f"{category}: {message}",
             actor,
+            created_at,
         )
     return created
 
 
-def run_compliance_check(as_of=None, actor="System"):
-    as_of = as_of or date.today()
+def run_compliance_check(as_of=None, actor="System", now=None):
+    check_time = normalize_datetime(now) if now is not None else datetime.now(timezone.utc)
+    as_of = as_of or check_time.astimezone(KOLKATA_TIMEZONE).date()
     settings = get_compliance_settings()
+    schedule = settings["notification_schedule"]
     active_keys = set()
     created_count = 0
     escalated_count = 0
 
-    for application in get_all_applications():
+    applications = get_all_applications()
+    applications_by_id = {application["id"]: application for application in applications}
+    for application in applications:
         application_id = application["id"]
         documents = list_application_documents(application_id)
 
@@ -1207,19 +1278,25 @@ def run_compliance_check(as_of=None, actor="System"):
                 and renewal_status in {"Not Required", "Approved"}
             ):
                 with connect_db() as connection:
-                    connection.execute(
-                        "UPDATE documents SET renewal_status = 'Awaiting Renewal', updated_at = ? WHERE id = ?",
-                        (now_iso(), document_id),
+                    renewal_update = connection.execute(
+                        """
+                        UPDATE documents
+                        SET renewal_status = 'Awaiting Renewal', updated_at = ?
+                        WHERE id = ? AND renewal_status IN ('Not Required', 'Approved')
+                        """,
+                        (now_iso(check_time), document_id),
                     )
-                document["renewal_status"] = "Awaiting Renewal"
-                renewal_status = "Awaiting Renewal"
-                record_event(
-                    application,
-                    "Document renewal required",
-                    application.get("stage"),
-                    f"Document {document_id} is within its configured expiry warning period.",
-                    actor,
-                )
+                if renewal_update.rowcount:
+                    document["renewal_status"] = "Awaiting Renewal"
+                    renewal_status = "Awaiting Renewal"
+                    record_event(
+                        application,
+                        "Document renewal required",
+                        application.get("stage"),
+                        f"Document {document_id} is within its configured expiry warning period.",
+                        actor,
+                        now_iso(check_time),
+                    )
             if renewal_submitted:
                 continue
             if status == "Rejected":
@@ -1230,7 +1307,7 @@ def run_compliance_check(as_of=None, actor="System"):
                 )
                 active_keys.add(key)
                 created_count += notification_event(
-                    application_id, "document_rejected", message, key, actor
+                    application_id, "document_rejected", message, key, actor, check_time
                 )
 
             if expiry and expiry < as_of:
@@ -1238,7 +1315,7 @@ def run_compliance_check(as_of=None, actor="System"):
                 message = f"{document['document_type']} ({document['name']}) expired on {expiry.isoformat()}."
                 active_keys.add(key)
                 created_count += notification_event(
-                    application_id, "document_expired", message, key, actor
+                    application_id, "document_expired", message, key, actor, check_time
                 )
             elif (
                 expiry
@@ -1252,20 +1329,42 @@ def run_compliance_check(as_of=None, actor="System"):
                 )
                 active_keys.add(key)
                 created_count += notification_event(
-                    application_id, "document_expiring", message, key, actor
+                    application_id, "document_expiring", message, key, actor, check_time
                 )
 
         due = parse_date(application.get("due_date"))
-        if due and due < as_of and not is_completed(application):
-            key = f"application_overdue:{application_id}:{due.isoformat()}"
-            active_keys.add(key)
-            created_count += notification_event(
-                application_id,
-                "application_overdue",
-                f"Application deadline passed on {due.isoformat()}.",
-                key,
-                actor,
-            )
+        if due and not is_completed(application):
+            if due < as_of:
+                key = f"application_overdue:{application_id}:{due.isoformat()}"
+                active_keys.add(key)
+                created_count += notification_event(
+                    application_id,
+                    "application_overdue",
+                    f"Application deadline passed on {due.isoformat()}.",
+                    key,
+                    actor,
+                    check_time,
+                )
+            else:
+                days_remaining = (due - as_of).days
+                lead_days = reminder_interval(
+                    days_remaining,
+                    schedule["deadline_reminder_days"],
+                )
+                if lead_days is not None:
+                    key = (
+                        f"application_deadline_reminder:{application_id}:"
+                        f"{due.isoformat()}:{lead_days}"
+                    )
+                    active_keys.add(key)
+                    created_count += notification_event(
+                        application_id,
+                        "application_deadline_reminder",
+                        f"Application deadline is {days_remaining} day(s) away on {due.isoformat()}.",
+                        key,
+                        actor,
+                        check_time,
+                    )
 
         application_expiry = parse_date(application.get("document_expiry_date"))
         if application_expiry and application_expiry < as_of:
@@ -1277,6 +1376,7 @@ def run_compliance_check(as_of=None, actor="System"):
                 f"Application compliance document expired on {application_expiry.isoformat()}.",
                 key,
                 actor,
+                check_time,
             )
         elif (
             application_expiry
@@ -1290,7 +1390,51 @@ def run_compliance_check(as_of=None, actor="System"):
                 f"Application compliance document expires on {application_expiry.isoformat()}.",
                 key,
                 actor,
+                check_time,
             )
+
+    with connect_db() as connection:
+        evc_records = connection.execute("""
+            SELECT application_id, scheduled_date, status
+            FROM evc_tracking
+            WHERE status != 'Completed' AND scheduled_date IS NOT NULL
+        """).fetchall()
+    for record in evc_records:
+        application_id = record["application_id"]
+        application = applications_by_id.get(application_id)
+        if application is None or not application_requires_evc(application):
+            continue
+        scheduled_date = parse_date(record["scheduled_date"])
+        if scheduled_date is None:
+            continue
+        if scheduled_date < as_of:
+            key = f"evc_overdue:{application_id}:{scheduled_date.isoformat()}"
+            active_keys.add(key)
+            created_count += notification_event(
+                application_id,
+                "evc_overdue",
+                f"The EVC scheduled for {scheduled_date.isoformat()} is overdue.",
+                key,
+                actor,
+                check_time,
+            )
+        else:
+            days_remaining = (scheduled_date - as_of).days
+            lead_days = reminder_interval(days_remaining, schedule["evc_reminder_days"])
+            if lead_days is not None:
+                key = (
+                    f"evc_scheduled_reminder:{application_id}:"
+                    f"{scheduled_date.isoformat()}:{lead_days}"
+                )
+                active_keys.add(key)
+                created_count += notification_event(
+                    application_id,
+                    "evc_scheduled_reminder",
+                    f"EVC is scheduled in {days_remaining} day(s), on {scheduled_date.isoformat()}.",
+                    key,
+                    actor,
+                    check_time,
+                )
 
     with connect_db() as connection:
         unresolved = connection.execute(
@@ -1299,43 +1443,49 @@ def run_compliance_check(as_of=None, actor="System"):
     for notification in unresolved:
         if notification["dedupe_key"] not in active_keys:
             with connect_db() as connection:
-                connection.execute(
+                resolved = connection.execute(
                     "UPDATE notifications SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL",
-                    (now_iso(), notification["id"]),
+                    (now_iso(check_time), notification["id"]),
                 )
-            application = find_application(notification["application_id"])
-            record_event(
-                application,
-                "Notification resolved",
-                application.get("stage"),
-                f"Notification {notification['id']} ({notification['category']}) is no longer active.",
-                actor,
-            )
+            if resolved.rowcount:
+                application = find_application(notification["application_id"])
+                record_event(
+                    application,
+                    "Notification resolved",
+                    application.get("stage"),
+                    f"Notification {notification['id']} ({notification['category']}) is no longer active.",
+                    actor,
+                    now_iso(check_time),
+                )
             continue
 
         created = datetime.fromisoformat(notification["created_at"])
-        if created.tzinfo is None:
-            created = created.replace(tzinfo=timezone.utc)
-        elapsed_days = max(0, (as_of - created.date()).days)
+        created_date = normalize_datetime(created).astimezone(KOLKATA_TIMEZONE).date()
+        elapsed_days = max(0, (as_of - created_date).days)
         level = sum(
             1 for threshold in settings["escalation_thresholds_days"]
             if elapsed_days >= threshold
         )
         if level > notification["escalation_level"]:
             with connect_db() as connection:
-                connection.execute(
-                    "UPDATE notifications SET escalation_level = ? WHERE id = ?",
-                    (level, notification["id"]),
+                escalated = connection.execute(
+                    """
+                    UPDATE notifications SET escalation_level = ?
+                    WHERE id = ? AND escalation_level < ? AND resolved_at IS NULL
+                    """,
+                    (level, notification["id"], level),
                 )
-            application = find_application(notification["application_id"])
-            record_event(
-                application,
-                "Notification escalated",
-                application.get("stage"),
-                f"Notification {notification['id']} ({notification['category']}) escalated to level {level}.",
-                actor,
-            )
-            escalated_count += 1
+            if escalated.rowcount:
+                application = find_application(notification["application_id"])
+                record_event(
+                    application,
+                    "Notification escalated",
+                    application.get("stage"),
+                    f"Notification {notification['id']} ({notification['category']}) escalated to level {level}.",
+                    actor,
+                    now_iso(check_time),
+                )
+                escalated_count += 1
 
     with connect_db() as connection:
         active_count = connection.execute(
@@ -1343,15 +1493,50 @@ def run_compliance_check(as_of=None, actor="System"):
         ).fetchone()[0]
     return {
         "checked_on": as_of.isoformat(),
+        "checked_at": now_iso(check_time),
         "created": created_count,
         "escalated": escalated_count,
         "active_notifications": active_count,
     }
 
 
+async def compliance_scheduler_loop(interval_seconds):
+    while True:
+        await asyncio.sleep(interval_seconds)
+        try:
+            loop = asyncio.get_running_loop()
+            await loop.run_in_executor(
+                None,
+                run_compliance_check,
+                None,
+                "System",
+            )
+        except Exception:
+            LOGGER.exception("Automated compliance check failed; it will retry next interval.")
+
+
 @app.on_event("startup")
-def startup_event():
+async def startup_event():
+    global COMPLIANCE_SCHEDULER_TASK
     initialize_database()
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, run_compliance_check, None, "System")
+    interval = get_compliance_settings()["notification_schedule"]["check_interval_seconds"]
+    COMPLIANCE_SCHEDULER_TASK = asyncio.create_task(
+        compliance_scheduler_loop(interval)
+    )
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global COMPLIANCE_SCHEDULER_TASK
+    if COMPLIANCE_SCHEDULER_TASK is not None:
+        COMPLIANCE_SCHEDULER_TASK.cancel()
+        try:
+            await COMPLIANCE_SCHEDULER_TASK
+        except asyncio.CancelledError:
+            pass
+        COMPLIANCE_SCHEDULER_TASK = None
 
 
 @app.get("/")
@@ -1524,7 +1709,7 @@ def get_workflows(user=Depends(get_current_user)):
 def get_evc_tracking(user=Depends(get_current_user)):
     settings = get_compliance_settings()
     evcs = list_evc_tracking()
-    today = date.today()
+    today = local_date()
     upcoming_cutoff = today + timedelta(
         days=settings["evc_tracking"]["upcoming_window_days"]
     )
@@ -1604,6 +1789,7 @@ def schedule_evc(
         + (f" Notes: {notes}" if notes else ""),
         user["username"],
     )
+    run_compliance_check(actor=user["username"])
     with connect_db() as connection:
         record = dict(connection.execute(
             "SELECT * FROM evc_tracking WHERE application_id = ?",
@@ -1660,6 +1846,7 @@ def complete_evc(
         "EVC completed." + (f" Notes: {notes}" if notes else ""),
         user["username"],
     )
+    run_compliance_check(actor=user["username"])
     with connect_db() as connection:
         record = dict(connection.execute(
             "SELECT * FROM evc_tracking WHERE application_id = ?",
@@ -1675,7 +1862,7 @@ def dashboard(user=Depends(get_current_user)):
     by_stage = {}
     by_region = {}
     by_officer = {}
-    today = date.today()
+    today = local_date()
     overdue = 0
     expired = 0
     expiring_soon = 0
@@ -2000,7 +2187,7 @@ def submit_document_renewal(
                 updated_at = ?
             WHERE id = ? AND application_id = ?
         """, (
-            dates["issue_date"], dates["expiry_date"], date.today().isoformat(),
+            dates["issue_date"], dates["expiry_date"], local_date().isoformat(),
             remarks.strip() if remarks else None, now_iso(), document_id, application_id,
         ))
 
@@ -2170,7 +2357,7 @@ def audit_trail(limit: int = 100, user=Depends(get_current_user)):
 
 @app.get("/api/monitoring")
 def compliance_monitoring(user=Depends(get_current_user)):
-    today = date.today()
+    today = local_date()
     results = []
     settings = get_compliance_settings()
     stage_entries = get_stage_entry_timestamps()

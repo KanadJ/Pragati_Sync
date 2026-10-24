@@ -3,6 +3,11 @@
   "expiry_warning_days": 30,
   "required_document_types": [],
   "escalation_thresholds_days": [3, 7],
+  "notification_schedule": {
+    "deadline_reminder_days": [1, 3, 7],
+    "evc_reminder_days": [1, 3, 7],
+    "check_interval_seconds": 3600
+  },
   "evc_tracking": {
     "upcoming_window_days": 30
   },

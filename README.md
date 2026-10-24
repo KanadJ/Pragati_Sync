@@ -183,25 +183,37 @@ viewed through `POST /api/notifications/{notification_id}/read`; Viewers can
 read the list but cannot change viewed status. Viewed state is stored per user,
 so dismissing a notification does not hide it from other users. Notifications
 remain in the database, and a newly triggered event for a resolved notification
-makes it visible again. Document rejection, expiry, and overdue application
-deadlines are checked when relevant document/compliance data is changed.
-Admins can also invoke `POST /api/compliance/check` from Monitoring to check
-all applications and advance unresolved notifications through the configured
-escalation thresholds. Repeated checks are deduplicated by issue and do not
-continuously create duplicate notifications.
+makes it visible again. Document rejection/expiry, application deadline reminders,
+overdue deadlines, and configured-route EVC reminders are checked when relevant
+document/compliance data changes, during startup catch-up, and periodically by
+the backend. Admins can also invoke `POST /api/compliance/check` to run a check
+immediately. Reminder intervals and the periodic interval are configurable in
+`backend/compliance_settings.json` under `notification_schedule`; the demo
+defaults are 7, 3, and 1 calendar days before deadlines/EVC visits, checked
+hourly. Each check uses the most urgent reached reminder window, so a missed
+check does not emit every older reminder interval at once. Overdue escalation
+thresholds are calendar days after the notification is created in Asia/Kolkata;
+the existing demo thresholds are 3 and 7 days.
 
-There is **no background scheduler** in this prototype. To periodically check
-deadlines and escalate unresolved notifications, an authorized operator must
-invoke the Admin-only check endpoint periodically, or an external deployment
-job must call it using a valid session. The endpoint is local/in-app only;
-email, SMS, institution-scoped visibility, and an automated schedule are not
-implemented. Document expiry warning notifications use the configured
-`expiry_warning_days` value and are deduplicated by document and expiry date;
-an in-progress renewal suppresses the old expiry alert until the renewal is
-approved or rejected. The `documents`, `notifications`, and per-user
-`notification_views` tables and their indexes are created idempotently at
-startup; existing application, notification, and audit records are preserved,
-and this feature requires no database reset.
+Notifications are deduplicated by issue, date, and reminder interval. Changing
+an application deadline or EVC scheduled date resolves the old active reminder;
+completed EVC visits resolve their active reminders. Escalation level changes
+and resolution are conditional updates so repeated checks do not duplicate
+their audit actions. Notification and per-user dismissal records are retained.
+Timestamps are stored in UTC, while date boundaries and displayed audit,
+notification, and document timestamps use Asia/Kolkata.
+
+The periodic checker runs as an asyncio task in each FastAPI process and runs
+a catch-up check during startup. It uses the existing SQLite database and does
+not require a dashboard request. This is suitable for the current single-process
+prototype, not a guarantee of production scheduling: multiple server instances
+may perform overlapping scans, and durability depends on the deployed SQLite
+storage surviving restarts. The repository does not configure or verify a
+persistent Render disk or multi-instance coordination. Email, SMS, and external
+recipient escalation are not implemented. The `documents`, `notifications`,
+and per-user `notification_views` tables and their indexes are created
+idempotently at startup; existing application, notification, and audit records
+are preserved, and this feature requires no database reset.
 
 ## Demo accounts
 

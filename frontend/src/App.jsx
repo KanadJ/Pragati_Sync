@@ -12,6 +12,18 @@ const FALLBACK_STAGES = [
   'Completed',
 ]
 
+function formatKolkataTimestamp(value, includeTime = true) {
+  if (!value) return ''
+  const timestamp = new Date(value)
+  if (Number.isNaN(timestamp.getTime())) return 'Timestamp unavailable'
+  return new Intl.DateTimeFormat('en-IN', {
+    timeZone: 'Asia/Kolkata',
+    ...(includeTime
+      ? { dateStyle: 'medium', timeStyle: 'short' }
+      : { dateStyle: 'medium' }),
+  }).format(timestamp)
+}
+
 function App() {
   const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || '')
   const [user, setUser] = useState(null)
@@ -1143,7 +1155,7 @@ function App() {
                   <div>
                     <strong>{item.category.replaceAll('_', ' ')} · escalation {item.escalation_level}</strong>
                     <p>{item.message}</p>
-                    <span>{item.application_id} · {new Date(item.created_at).toLocaleString()} · {item.resolved_at ? 'Resolved' : item.is_read ? 'Read' : 'Unread'}</span>
+                    <span>{item.application_id} · {formatKolkataTimestamp(item.created_at)} · {item.resolved_at ? 'Resolved' : item.is_read ? 'Read' : 'Unread'}</span>
                     <div className="form-actions">
                       <button className="secondary-button" onClick={() => {
                         setSelectedId(item.application_id)
@@ -1275,7 +1287,7 @@ function App() {
                   <div>
                     <strong>{event.action}</strong>
                     <p>{event.application_id} · {event.stage || '—'}</p>
-                    <span>{event.timestamp ? new Date(event.timestamp).toLocaleString() : 'Timestamp unavailable'}</span>
+                    <span>{event.timestamp ? formatKolkataTimestamp(event.timestamp) : 'Timestamp unavailable'}</span>
                     {event.actor && <p>Actor: {event.actor}</p>}
                     {event.details && <p>{event.details}</p>}
                   </div>
@@ -1429,7 +1441,7 @@ function App() {
                 const edit = documentEdits[document.id] || {}
                 return (
                   <div className="document-row" key={document.id}>
-                    <span>Created {new Date(document.created_at).toLocaleDateString()}</span>
+                    <span>Created {formatKolkataTimestamp(document.created_at, false)}</span>
                     <span>Tracking: {document.tracking_status || '—'} · Renewal: {document.renewal_status || 'Not Required'}</span>
                     <label>Document type
                       <input
@@ -1525,7 +1537,7 @@ function App() {
                     <strong>{event.action}</strong>
                     <p>{event.details || event.stage}</p>
                     {event.actor && <p>Actor: {event.actor}</p>}
-                    <span>{event.timestamp ? new Date(event.timestamp).toLocaleString() : ''}</span>
+                    <span>{event.timestamp ? formatKolkataTimestamp(event.timestamp) : ''}</span>
                   </div>
                 </div>
               ))}
