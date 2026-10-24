@@ -216,6 +216,65 @@ class DocumentComplianceTests(unittest.TestCase):
         self.assertIn("Notification created", actions)
         self.assertIn("Notification marked read", actions)
 
+    def test_marking_notification_viewed_hides_it_for_that_user_after_refetch(self):
+        officer = self.login("officer")
+        created = self.create_document(
+            officer,
+            status="Rejected",
+            reviewer_remarks="Lease signature is missing.",
+        )
+        self.assertEqual(created.status_code, 201)
+        notification = self.client.get(
+            "/api/notifications",
+            headers=officer,
+        ).json()["notifications"][0]
+
+        marked = self.client.post(
+            f"/api/notifications/{notification['id']}/read",
+            headers=officer,
+        )
+        self.assertEqual(marked.status_code, 200)
+        self.assertEqual(marked.json()["notification"]["is_read"], 1)
+        self.assertEqual(
+            self.client.get("/api/notifications", headers=officer).json()["notifications"],
+            [],
+        )
+
+        with main.connect_db() as connection:
+            stored = connection.execute(
+                "SELECT id FROM notifications WHERE id = ?",
+                (notification["id"],),
+            ).fetchone()
+        self.assertIsNotNone(stored)
+
+        viewer = self.login("viewer")
+        other_user_notifications = self.client.get(
+            "/api/notifications",
+            headers=viewer,
+        ).json()["notifications"]
+        self.assertEqual([item["id"] for item in other_user_notifications], [notification["id"]])
+
+        with main.connect_db() as connection:
+            connection.execute(
+                "UPDATE notifications SET resolved_at = ? WHERE id = ?",
+                (main.now_iso(), notification["id"]),
+            )
+            dedupe_key = connection.execute(
+                "SELECT dedupe_key FROM notifications WHERE id = ?",
+                (notification["id"],),
+            ).fetchone()["dedupe_key"]
+        self.assertTrue(main.notification_event(
+            "COMPLIANCE-1",
+            notification["category"],
+            notification["message"],
+            dedupe_key,
+            "officer",
+        ))
+        self.assertEqual(
+            len(self.client.get("/api/notifications", headers=officer).json()["notifications"]),
+            1,
+        )
+
     def test_expiry_notifications_escalate_at_configured_threshold_once(self):
         officer = self.login("officer")
         expiry = (date.today() - timedelta(days=1)).isoformat()
