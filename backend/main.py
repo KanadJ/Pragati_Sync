@@ -15,14 +15,15 @@ from fastapi import Body, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
 
-DEVELOPMENT_ORIGINS = (
+DEFAULT_CORS_ORIGINS = (
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "https://aicte-approval-frontend.onrender.com",
 )
 
 
 def parse_cors_origins(value):
-    origins = list(DEVELOPMENT_ORIGINS)
+    origins = list(DEFAULT_CORS_ORIGINS)
     if not value:
         return origins
 
