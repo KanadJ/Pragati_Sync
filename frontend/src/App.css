@@ -85,6 +85,14 @@ tbody tr:hover, tbody tr.selected-row { background: #f7faff; }
 .open-button:hover, .close-button:hover { background: #edf2f8; }
 footer { display: flex; justify-content: space-between; gap: 12px; color: #8994a3; font-size: 10px; margin-top: 28px; }
 .panel { background: #fff; border: 1px solid #e3e8ef; border-radius: 8px; padding: 24px; }
+.dashboard-summary-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; margin: -12px 0 30px; }
+.dashboard-summary { min-width: 0; padding: 17px; }
+.dashboard-summary h2 { font-size: 13px; margin-bottom: 12px; }
+.dashboard-summary-row { display: flex; justify-content: space-between; gap: 12px; border-top: 1px solid #edf0f4; padding: 9px 0; font-size: 11px; }
+.dashboard-summary-row span { min-width: 0; overflow-wrap: anywhere; color: #526176; }
+.dashboard-summary-row strong { flex: 0 0 auto; color: #174a83; }
+.dashboard-state { margin: -12px 0 30px; font-size: 12px; }
+.dashboard-state p { margin: 7px 0 12px; color: #7b8798; }
 .create-application-form { margin-bottom: 18px; }
 .create-application-form h3 { font-size: 15px; margin-bottom: 7px; }
 .create-fields-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; margin: 18px 0; }
@@ -152,6 +160,7 @@ footer { display: flex; justify-content: space-between; gap: 12px; color: #8994a
   .page-content { padding: 27px 22px; }
   .topbar { padding: 0 22px; }
   .stats-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .dashboard-summary-grid { grid-template-columns: 1fr; }
   td, th { padding: 13px 10px; }
 }
 @media (max-width: 700px) {

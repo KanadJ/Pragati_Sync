@@ -880,6 +880,8 @@ def dashboard(user=Depends(get_current_user)):
     applications = get_all_applications()
     by_status = {}
     by_stage = {}
+    by_region = {}
+    by_officer = {}
     today = date.today()
     overdue = 0
     expired = 0
@@ -888,9 +890,16 @@ def dashboard(user=Depends(get_current_user)):
 
     for application in applications:
         status = application.get("status", "Unknown")
-        stage = application.get("stage", "Unknown")
+        stage = application.get("stage")
+        region = application.get("region")
+        officer = application.get("officer")
+        stage = stage.strip() if isinstance(stage, str) and stage.strip() else "Unknown"
+        region = region.strip() if isinstance(region, str) and region.strip() else "Unassigned"
+        officer = officer.strip() if isinstance(officer, str) and officer.strip() else "Unassigned"
         by_status[status] = by_status.get(status, 0) + 1
         by_stage[stage] = by_stage.get(stage, 0) + 1
+        by_region[region] = by_region.get(region, 0) + 1
+        by_officer[officer] = by_officer.get(officer, 0) + 1
 
         due = parse_date(application.get("due_date"))
         expiry = parse_date(application.get("document_expiry_date"))
@@ -926,6 +935,8 @@ def dashboard(user=Depends(get_current_user)):
         "audit_events": audit_count,
         "by_status": by_status,
         "by_stage": by_stage,
+        "by_region": by_region,
+        "by_officer": by_officer,
     }
 
 

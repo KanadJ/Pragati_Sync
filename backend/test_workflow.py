@@ -2,6 +2,7 @@ import json
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -118,6 +119,68 @@ class WorkflowAutomationTests(unittest.TestCase):
             self.audit_actions("TEST-CREATED"),
             ["Application created", "Workflow automatically assigned"],
         )
+
+    def test_dashboard_aggregates_by_region_officer_and_stage_with_missing_values(self):
+        headers = self.login("viewer")
+        applications = [
+            {
+                "region": "North",
+                "officer": "Officer A",
+                "stage": "Document Verification",
+                "status": "Pending",
+            },
+            {
+                "region": "North",
+                "officer": "Officer A",
+                "stage": "Document Verification",
+                "status": "Returned",
+            },
+            {
+                "region": "South",
+                "officer": "Officer B",
+                "stage": "Completed",
+                "status": "Approved",
+            },
+            {
+                "region": None,
+                "officer": "  ",
+                "stage": None,
+                "status": "Pending",
+            },
+        ]
+
+        with patch("main.get_all_applications", return_value=applications):
+            response = self.client.get("/api/dashboard", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        dashboard = response.json()
+        self.assertEqual(dashboard["total_applications"], 4)
+        self.assertEqual(
+            dashboard["by_region"],
+            {"North": 2, "South": 1, "Unassigned": 1},
+        )
+        self.assertEqual(
+            dashboard["by_officer"],
+            {"Officer A": 2, "Officer B": 1, "Unassigned": 1},
+        )
+        self.assertEqual(
+            dashboard["by_stage"],
+            {"Document Verification": 2, "Completed": 1, "Unknown": 1},
+        )
+
+    def test_dashboard_returns_empty_aggregates_for_empty_application_list(self):
+        headers = self.login("viewer")
+        with patch("main.get_all_applications", return_value=[]):
+            response = self.client.get("/api/dashboard", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        dashboard = response.json()
+        self.assertEqual(dashboard["total_applications"], 0)
+        self.assertEqual(dashboard["pending_requests"], 0)
+        self.assertEqual(dashboard["approved"], 0)
+        self.assertEqual(dashboard["by_region"], {})
+        self.assertEqual(dashboard["by_officer"], {})
+        self.assertEqual(dashboard["by_stage"], {})
 
     def test_only_admin_can_create_applications(self):
         payload = self.create_payload("TEST-OFFICER-CREATE")

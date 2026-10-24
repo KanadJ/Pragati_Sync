@@ -22,6 +22,8 @@ function App() {
   const [loginError, setLoginError] = useState('')
 
   const [applications, setApplications] = useState([])
+  const [dashboardData, setDashboardData] = useState(null)
+  const [dashboardError, setDashboardError] = useState('')
   const [workflows, setWorkflows] = useState({})
   const [auditEvents, setAuditEvents] = useState([])
   const [monitoring, setMonitoring] = useState(null)
@@ -98,13 +100,16 @@ function App() {
   }, [token])
 
   const refreshData = useCallback(async () => {
-    const [apps, workflowData, auditData, monitoringData, notificationData] =
+    const [apps, workflowData, auditData, monitoringData, notificationData, dashboardResult] =
       await Promise.all([
         request('/api/applications'),
         request('/api/workflows'),
         request('/api/audit'),
         request('/api/monitoring'),
         request('/api/notifications'),
+        request('/api/dashboard')
+          .then((data) => ({ data, error: '' }))
+          .catch((error) => ({ data: null, error: error.message })),
       ])
 
     setApplications(apps)
@@ -112,6 +117,8 @@ function App() {
     setAuditEvents(auditData.events || [])
     setMonitoring(monitoringData)
     setNotifications(notificationData.notifications || [])
+    setDashboardData(dashboardResult.data)
+    setDashboardError(dashboardResult.error)
 
     setSelectedId((current) => {
       if (current && apps.some((item) => item.id === current)) return current
@@ -217,6 +224,8 @@ function App() {
     setToken('')
     setUser(null)
     setApplications([])
+    setDashboardData(null)
+    setDashboardError('')
     setWorkflows({})
     setAuditEvents([])
     setMonitoring(null)
@@ -292,15 +301,6 @@ function App() {
       return matchesSearch && (filter === 'All' || item.status === filter)
     })
   }, [applications, search, filter])
-
-  const counts = {
-    total: applications.length,
-    pending: applications.filter((item) =>
-      ['Pending', 'Under Review', 'Returned'].includes(item.status)
-    ).length,
-    approved: applications.filter((item) => item.status === 'Approved').length,
-    returned: applications.filter((item) => item.status === 'Returned').length,
-  }
 
   // Monitoring alerts are objects: { severity, type, message }.
   const allAlerts = (monitoring?.applications || []).flatMap((item) =>
@@ -684,11 +684,29 @@ function App() {
           {page === 'Dashboard' && (
             <>
               <div className="stats-grid">
-                <Stat label="Total applications" value={counts.total} note="Across all regions" symbol="▤" />
-                <Stat label="Pending action" value={counts.pending} note="Awaiting processing" symbol="◷" />
-                <Stat label="Approved" value={counts.approved} note="Completed applications" symbol="✓" />
-                <Stat label="Returned" value={counts.returned} note="Requires correction" symbol="↶" />
+                <Stat label="Total applications" value={dashboardData?.total_applications ?? '—'} note="Across all regions" symbol="▤" />
+                <Stat label="Pending action" value={dashboardData?.pending_requests ?? '—'} note="Awaiting processing" symbol="◷" />
+                <Stat label="Approved" value={dashboardData?.approved ?? '—'} note="Completed applications" symbol="✓" />
+                <Stat label="Returned" value={dashboardData ? dashboardData.by_status?.Returned || 0 : '—'} note="Requires correction" symbol="↶" />
               </div>
+
+              {dashboardError ? (
+                <div className="panel dashboard-state" role="alert">
+                  <strong>Dashboard analytics could not be loaded.</strong>
+                  <p>{dashboardError}</p>
+                  <button className="secondary-button" onClick={() => refreshData().catch((error) => setNotice(error.message))}>
+                    Retry
+                  </button>
+                </div>
+              ) : !dashboardData ? (
+                <div className="panel dashboard-state" role="status">Loading dashboard analytics...</div>
+              ) : (
+                <div className="dashboard-summary-grid">
+                  <DashboardSummary title="Applications by region" data={dashboardData.by_region} />
+                  <DashboardSummary title="Applications by assigned officer" data={dashboardData.by_officer} />
+                  <DashboardSummary title="Applications by workflow stage" data={dashboardData.by_stage} />
+                </div>
+              )}
 
               <div className="section-heading">
                 <div><h2>Application register</h2><p>Search, filter and select an application to review.</p></div>
@@ -1210,6 +1228,27 @@ function Status({ status }) {
 
 function Detail({ label, value }) {
   return <div className="detail-item"><span>{label}</span><strong>{value || '—'}</strong></div>
+}
+
+function DashboardSummary({ title, data = {} }) {
+  const entries = Object.entries(data)
+    .sort(([leftName, leftCount], [rightName, rightCount]) =>
+      rightCount - leftCount || leftName.localeCompare(rightName)
+    )
+
+  return (
+    <div className="panel dashboard-summary">
+      <h2>{title}</h2>
+      {entries.length === 0 ? (
+        <div className="empty-state">No applications to summarize.</div>
+      ) : entries.map(([label, count]) => (
+        <div className="dashboard-summary-row" key={label}>
+          <span>{label}</span>
+          <strong>{count}</strong>
+        </div>
+      ))}
+    </div>
+  )
 }
 
 function ApplicationFilters({ search, setSearch, filter, setFilter }) {
