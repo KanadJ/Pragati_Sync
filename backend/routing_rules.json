@@ -1,0 +1,45 @@
+{
+  "notice": "DEMO RULES ONLY. These rules are not official AICTE/APH rules and require validation against current official guidance before operational use.",
+  "rules": [
+    {
+      "id": "demo-scrutiny-evc-sac-shc",
+      "when": {
+        "requires_scrutiny": true,
+        "requires_evc": true,
+        "requires_sac_shc": true
+      },
+      "route": "SCRUTINY_EVC_SAC_SHC",
+      "reason": "Demo attributes indicate scrutiny, EVC, and SAC/SHC."
+    },
+    {
+      "id": "demo-evc-sac-shc",
+      "when": {
+        "requires_evc": true,
+        "requires_sac_shc": true
+      },
+      "route": "EVC_SAC_SHC",
+      "reason": "Demo attributes indicate EVC and SAC/SHC."
+    },
+    {
+      "id": "demo-scrutiny-evc",
+      "when": {
+        "requires_evc": true
+      },
+      "route": "SCRUTINY_EVC",
+      "reason": "Demo attributes indicate an EVC."
+    },
+    {
+      "id": "demo-scrutiny-only",
+      "when": {
+        "requires_scrutiny": true
+      },
+      "route": "SCRUTINY_ONLY",
+      "reason": "Demo attributes indicate scrutiny without an EVC."
+    }
+  ],
+  "default": {
+    "id": "demo-standard-default",
+    "route": "STANDARD",
+    "reason": "No configured demo routing condition matched."
+  }
+}

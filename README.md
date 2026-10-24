@@ -129,6 +129,21 @@ Do not deploy the demo accounts or passwords to a production environment.
 Production use requires managed identity, configurable secrets, and an
 appropriate session lifecycle.
 
+## Temporary Render demo configuration
+
+The backend can be started from the `backend` directory with
+`uvicorn main:app --host 0.0.0.0 --port $PORT`. Set `CORS_ORIGINS` to a
+comma-separated list containing the deployed frontend origin, for example
+`https://your-frontend.onrender.com`; localhost development origins remain
+allowed. The frontend accepts the backend URL through the Vite build-time
+variable `VITE_API_URL`, for example
+`https://your-backend.onrender.com`, and falls back to
+`http://localhost:8000` for local development.
+
+This SQLite-backed configuration is for a temporary demonstration: Render
+free-service restarts may discard database changes and in-memory login
+sessions. Do not use it for durable or sensitive production data.
+
 ## Running backend security tests
 
 From the repository root, run:

@@ -2,15 +2,56 @@
 import hashlib
 import hmac
 import json
+import os
 import secrets
 import sqlite3
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
 from threading import Lock
+from urllib.parse import urlsplit
 
 from fastapi import Body, Depends, FastAPI, Header, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+
+
+DEVELOPMENT_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+)
+
+
+def parse_cors_origins(value):
+    origins = list(DEVELOPMENT_ORIGINS)
+    if not value:
+        return origins
+
+    for configured_origin in value.split(","):
+        origin = configured_origin.strip().rstrip("/")
+        if not origin:
+            continue
+        parsed = urlsplit(origin)
+        try:
+            parsed.port
+        except ValueError as error:
+            raise ValueError(f"Invalid CORS origin: {configured_origin.strip()}") from error
+        if (
+            "*" in origin
+            or parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.path
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError(f"Invalid CORS origin: {configured_origin.strip()}")
+        if origin not in origins:
+            origins.append(origin)
+    return origins
+
+
+CORS_ORIGINS = parse_cors_origins(os.getenv("CORS_ORIGINS", ""))
 
 
 app = FastAPI(
@@ -21,7 +62,7 @@ app = FastAPI(
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173"],
+    allow_origins=CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
