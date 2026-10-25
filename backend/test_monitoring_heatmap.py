@@ -71,7 +71,7 @@ class WorkflowHeatmapTests(unittest.TestCase):
 
     def test_heatmap_aggregates_real_regions_stages_zeroes_and_unknowns(self):
         self.add_application("HEAT-1", region="North")
-        self.add_application("HEAT-2", region="north")
+        self.add_application("HEAT-2", region="north", stage="application review")
         self.add_application("HEAT-3", region="South", stage="Completed")
         self.add_application(
             "HEAT-4",
@@ -138,6 +138,11 @@ class WorkflowHeatmapTests(unittest.TestCase):
             status="Approved",
             stage="Completed",
         )
+        self.add_application(
+            "RISK-UNKNOWN",
+            due_date="invalid-date",
+            region="East",
+        )
         headers = self.login()
 
         with patch("main.local_date", return_value=today):
@@ -182,6 +187,7 @@ class WorkflowHeatmapTests(unittest.TestCase):
             for application in cell["applications"]
         ]
         self.assertEqual(high_risk_body["matching_applications"], 1)
+        self.assertEqual(high_risk_body["total_applications"], 5)
         self.assertEqual(
             sum(cell["count"] for row in high_risk_body["regions"] for cell in row["cells"]),
             high_risk_body["matching_applications"],

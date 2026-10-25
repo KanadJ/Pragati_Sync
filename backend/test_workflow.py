@@ -171,6 +171,108 @@ class WorkflowAutomationTests(unittest.TestCase):
             {"Document Verification": 2, "Completed": 1, "Unknown": 1},
         )
 
+    def test_dashboard_normalizes_status_stage_region_and_deadline_counts(self):
+        headers = self.login("viewer")
+        today = date(2026, 10, 25)
+        applications = [
+            {
+                "region": "North",
+                "officer": " Officer A ",
+                "stage": " application review ",
+                "status": " pending ",
+                "due_date": (today - timedelta(days=1)).isoformat(),
+            },
+            {
+                "region": "north",
+                "officer": "Officer A",
+                "stage": "document verification",
+                "status": " RETURNED ",
+                "due_date": today.isoformat(),
+            },
+            {
+                "region": "North",
+                "officer": "Officer B",
+                "stage": " completed ",
+                "status": "Pending",
+                "due_date": (today - timedelta(days=5)).isoformat(),
+            },
+            {
+                "region": "South",
+                "officer": "Officer B",
+                "stage": "Final Approval",
+                "status": "aPpRoVeD",
+                "due_date": (today + timedelta(days=2)).isoformat(),
+            },
+            {
+                "region": None,
+                "officer": None,
+                "stage": None,
+                "status": None,
+                "due_date": "invalid-date",
+            },
+            {
+                "region": "south",
+                "officer": "Officer C",
+                "stage": "Application Review",
+                "status": "Under Review",
+                "due_date": "invalid-date",
+            },
+            {
+                "region": "North",
+                "officer": "Officer D",
+                "stage": "Legacy Stage",
+                "status": "Custom Status",
+                "due_date": "invalid-date",
+            },
+            {
+                "region": "north",
+                "officer": "Officer E",
+                "stage": "legacy stage",
+                "status": "custom status",
+                "due_date": "invalid-date",
+            },
+        ]
+
+        with (
+            patch("main.get_all_applications", return_value=applications),
+            patch("main.local_date", return_value=today),
+        ):
+            response = self.client.get("/api/dashboard", headers=headers)
+
+        self.assertEqual(response.status_code, 200)
+        dashboard = response.json()
+        self.assertEqual(dashboard["total_applications"], 8)
+        self.assertEqual(dashboard["pending_requests"], 3)
+        self.assertEqual(dashboard["approved"], 2)
+        self.assertEqual(
+            dashboard["by_status"],
+            {
+                "Pending": 1,
+                "Returned": 1,
+                "Approved": 2,
+                "Unknown": 1,
+                "Under Review": 1,
+                "Custom Status": 2,
+            },
+        )
+        self.assertEqual(sum(dashboard["by_status"].values()), 8)
+        self.assertEqual(
+            dashboard["by_stage"],
+            {
+                "Application Review": 2,
+                "Document Verification": 1,
+                "Completed": 1,
+                "Final Approval": 1,
+                "Unknown": 1,
+                "Legacy Stage": 2,
+            },
+        )
+        self.assertEqual(sum(dashboard["by_stage"].values()), 8)
+        self.assertEqual(dashboard["by_region"], {"North": 5, "South": 2, "Unassigned": 1})
+        self.assertEqual(sum(dashboard["by_region"].values()), 8)
+        self.assertEqual(dashboard["overdue_applications"], 1)
+        self.assertEqual(dashboard["deadlines_soon"], 1)
+
     def test_dashboard_returns_empty_aggregates_for_empty_application_list(self):
         headers = self.login("viewer")
         with patch("main.get_all_applications", return_value=[]):
@@ -603,7 +705,7 @@ class WorkflowAutomationTests(unittest.TestCase):
                         ?, 'officer')
             """, (
                 application_id,
-                "Document Verification",
+                " document verification ",
                 (today - timedelta(days=30)).isoformat() + "T12:00:00+00:00",
             ))
 

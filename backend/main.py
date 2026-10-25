@@ -435,6 +435,27 @@ def get_all_applications():
     return [json.loads(row["data"]) for row in rows]
 
 
+def normalized_application_label(value, fallback="Unknown"):
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    return fallback
+
+
+def canonical_configured_label(value, configured_labels):
+    label = normalized_application_label(value)
+    labels_by_key = {item.casefold(): item for item in configured_labels}
+    return labels_by_key.get(label.casefold(), label)
+
+
+def canonical_application_status(application):
+    if is_completed(application):
+        return "Approved"
+    return canonical_configured_label(
+        application.get("status"),
+        ("Pending", "Under Review", "Returned", "Approved"),
+    )
+
+
 def get_compliance_settings():
     try:
         with COMPLIANCE_SETTINGS_PATH.open(encoding="utf-8") as settings_file:
@@ -740,8 +761,18 @@ def get_stage_entry_timestamps():
             continue
         timestamp = parse_datetime(row["timestamp"])
         if timestamp is not None:
-            timestamps[(row["application_id"], row["stage"])] = timestamp
+            timestamps[(
+                row["application_id"],
+                row["stage"].strip().casefold(),
+            )] = timestamp
     return timestamps
+
+
+def get_application_stage_entry_timestamp(stage_entries, application):
+    stage = application.get("stage")
+    if not isinstance(stage, str) or not stage.strip():
+        return None
+    return stage_entries.get((application["id"], stage.strip().casefold()))
 
 
 def parse_datetime(value):
@@ -1205,9 +1236,11 @@ def ensure_workflow_not_started(application):
 
 
 def is_completed(application):
+    stage = normalized_application_label(application.get("stage"), "").casefold()
+    status = normalized_application_label(application.get("status"), "").casefold()
     return (
-        application.get("stage") == "Completed"
-        or application.get("status") == "Approved"
+        stage == "completed"
+        or status == "approved"
     )
 
 
@@ -1873,6 +1906,9 @@ def dashboard(user=Depends(get_current_user)):
     by_status = {}
     by_stage = {}
     by_region = {}
+    region_labels = {}
+    status_labels = {}
+    stage_labels = {}
     by_officer = {}
     today = local_date()
     overdue = 0
@@ -1881,16 +1917,24 @@ def dashboard(user=Depends(get_current_user)):
     deadlines_soon = 0
 
     for application in applications:
-        status = application.get("status", "Unknown")
-        stage = application.get("stage")
+        status = canonical_application_status(application)
+        status_key = status.casefold()
+        status = status_labels.setdefault(status_key, status)
+        stage = canonical_configured_label(
+            application.get("stage"),
+            (stage for route in WORKFLOW_ROUTES.values() for stage in route),
+        )
+        stage_key = stage.casefold()
+        stage = stage_labels.setdefault(stage_key, stage)
         region = application.get("region")
         officer = application.get("officer")
-        stage = stage.strip() if isinstance(stage, str) and stage.strip() else "Unknown"
-        region = region.strip() if isinstance(region, str) and region.strip() else "Unassigned"
-        officer = officer.strip() if isinstance(officer, str) and officer.strip() else "Unassigned"
+        region = normalized_application_label(region, "Unassigned")
+        officer = normalized_application_label(officer, "Unassigned")
         by_status[status] = by_status.get(status, 0) + 1
         by_stage[stage] = by_stage.get(stage, 0) + 1
-        by_region[region] = by_region.get(region, 0) + 1
+        region_key = region.casefold()
+        region_label = region_labels.setdefault(region_key, region)
+        by_region[region_label] = by_region.get(region_label, 0) + 1
         by_officer[officer] = by_officer.get(officer, 0) + 1
 
         due = parse_date(application.get("due_date"))
@@ -1914,12 +1958,13 @@ def dashboard(user=Depends(get_current_user)):
     return {
         "total_applications": len(applications),
         "pending_requests": sum(
-            1 for a in applications
-            if a.get("status") in ("Pending", "Under Review", "Returned")
+            count
+            for status, count in by_status.items()
+            if status in ("Pending", "Under Review", "Returned")
         ),
         "active_blocks": 0,
         "emergency_jobs": 0,
-        "approved": sum(1 for a in applications if is_completed(a)),
+        "approved": by_status.get("Approved", 0),
         "overdue_applications": overdue,
         "expired_documents": expired,
         "expiring_soon_documents": expiring_soon,
@@ -2428,7 +2473,7 @@ def compliance_monitoring(user=Depends(get_current_user)):
             application,
             documents,
             settings,
-            stage_entries.get((application["id"], application.get("stage"))),
+            get_application_stage_entry_timestamp(stage_entries, application),
             today,
         )
         for document in documents:
@@ -2520,10 +2565,11 @@ def workflow_heatmap(metric: str = "applications", user=Depends(get_current_user
             region_key = "unknown"
             region_labels[region_key] = "Unknown / missing region"
 
-        stage = application.get("stage")
-        if isinstance(stage, str) and stage.strip() in configured_stage_set:
-            stage = stage.strip()
-        else:
+        stage = canonical_configured_label(
+            application.get("stage"),
+            configured_stages,
+        )
+        if stage not in configured_stage_set:
             stage = "Unknown stage"
             has_unknown_stage = True
         categorized_applications.append((application, region_key, stage))
@@ -2557,7 +2603,7 @@ def workflow_heatmap(metric: str = "applications", user=Depends(get_current_user
                 application,
                 list_application_documents(application["id"]),
                 settings,
-                stage_entries.get((application["id"], application.get("stage"))),
+                get_application_stage_entry_timestamp(stage_entries, application),
                 today,
             )
             include_application = risk["risk_level"] in {"High", "Critical"}
@@ -2692,7 +2738,10 @@ def export_pendency_report(user=Depends(get_current_user)):
             deadline_state = "Upcoming"
             days_until_deadline = (due - today).days
 
-        stage_entry = stage_entries.get((application_id, stage))
+        stage_entry = get_application_stage_entry_timestamp(
+            stage_entries,
+            application,
+        )
         if stage_entry is None:
             stage_entry_text = "Unknown"
             pending_duration = "Not pending" if completed else "Unknown"

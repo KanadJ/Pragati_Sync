@@ -74,6 +74,9 @@ function App() {
   const [busy, setBusy] = useState(false)
   const [reportBusy, setReportBusy] = useState(false)
   const [selectedId, setSelectedId] = useState('')
+  const selected = applications.find((item) => item.id === selectedId)
+  const selectedDueDate = selected?.due_date || ''
+  const selectedExpiryDate = selected?.document_expiry_date || ''
   const [search, setSearch] = useState('')
   const [filter, setFilter] = useState('All')
   const [returnReason, setReturnReason] = useState('')
@@ -90,9 +93,28 @@ function App() {
     requires_evc: false,
     requires_sac_shc: false,
   })
-  const [dueDate, setDueDate] = useState('')
-  const [expiryDate, setExpiryDate] = useState('')
+  const [complianceDateDraft, setComplianceDateDraft] = useState({
+    applicationId: selectedId,
+    sourceDueDate: selectedDueDate,
+    sourceExpiryDate: selectedExpiryDate,
+    dueDate: selectedDueDate,
+    expiryDate: selectedExpiryDate,
+  })
+  if (
+    complianceDateDraft.applicationId !== selectedId
+    || complianceDateDraft.sourceDueDate !== selectedDueDate
+    || complianceDateDraft.sourceExpiryDate !== selectedExpiryDate
+  ) {
+    setComplianceDateDraft({
+      applicationId: selectedId,
+      sourceDueDate: selectedDueDate,
+      sourceExpiryDate: selectedExpiryDate,
+      dueDate: selectedDueDate,
+      expiryDate: selectedExpiryDate,
+    })
+  }
   const [notice, setNotice] = useState('')
+  const [noticeType, setNoticeType] = useState('info')
   const [page, setPage] = useState('Dashboard')
   const [mobileNavOpen, setMobileNavOpen] = useState(false)
 
@@ -100,6 +122,16 @@ function App() {
   const isAdmin = role.toLowerCase() === 'admin'
   const canProcess = ['admin', 'officer'].includes(role.toLowerCase())
   const canEditWorkflow = isAdmin
+
+  const showNotice = useCallback((message, type = 'success') => {
+    setNoticeType(type)
+    setNotice(message)
+  }, [])
+
+  const clearNotice = useCallback(() => {
+    setNotice('')
+    setNoticeType('info')
+  }, [])
 
   const request = useCallback(async (path, options = {}) => {
     const currentToken = token || localStorage.getItem(TOKEN_KEY)
@@ -264,17 +296,14 @@ function App() {
 
   // Load application data only after authentication.
   useEffect(() => {
-    if (!user || !token) {
-      setLoading(false)
-      return
-    }
+    if (!user || !token) return
 
     let active = true
-    setLoading(true)
 
-    refreshData()
+    Promise.resolve()
+      .then(() => refreshData())
       .catch((error) => {
-        if (active) setNotice(`Could not load backend data: ${error.message}`)
+        if (active) showNotice(`Could not load backend data: ${error.message}`, 'error')
       })
       .finally(() => {
         if (active) setLoading(false)
@@ -283,7 +312,7 @@ function App() {
     return () => {
       active = false
     }
-  }, [user, token, refreshData])
+  }, [user, token, refreshData, showNotice])
 
   async function handleLogin(event) {
     event.preventDefault()
@@ -301,11 +330,12 @@ function App() {
       }
 
       localStorage.setItem(TOKEN_KEY, data.access_token)
+      setLoading(true)
       setToken(data.access_token)
       setUser(data.user)
       setPassword('')
       setPage('Dashboard')
-      setNotice('')
+      clearNotice()
     } catch (error) {
       setLoginError(error.message || 'Login failed.')
     } finally {
@@ -340,17 +370,10 @@ function App() {
     setComplianceSummary(null)
     setSelectedId('')
     setShowReturn(false)
-    setNotice('')
+    clearNotice()
     setLoginError('')
     setPage('Dashboard')
   }
-
-  const selected = applications.find((item) => item.id === selectedId)
-
-  useEffect(() => {
-    setDueDate(selected?.due_date || '')
-    setExpiryDate(selected?.document_expiry_date || '')
-  }, [selectedId, selected?.due_date, selected?.document_expiry_date])
 
   const refreshDocuments = useCallback(async () => {
     if (!selectedId) return
@@ -392,10 +415,10 @@ function App() {
         ])))
       })
       .catch((error) => {
-        if (active) setNotice(`Could not load document register: ${error.message}`)
+        if (active) showNotice(`Could not load document register: ${error.message}`, 'error')
       })
     return () => { active = false }
-  }, [request, selectedId, user])
+  }, [request, selectedId, user, showNotice])
 
   const filtered = useMemo(() => {
     const query = search.toLowerCase()
@@ -518,7 +541,7 @@ function App() {
     if (!selected || busy || !canProcess) return
 
     setBusy(true)
-    setNotice('')
+    clearNotice()
 
     try {
       const options = action === 'return'
@@ -541,9 +564,9 @@ function App() {
             return: 'Application returned successfully. Audit history saved.',
             resubmit: 'Corrections resubmitted. The workflow can continue.',
           }[action] || 'Application workflow updated successfully.'
-      setNotice(successMessage)
+      showNotice(successMessage)
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     } finally {
       setBusy(false)
     }
@@ -553,7 +576,7 @@ function App() {
     if (!selected || busy || !canEditWorkflow) return
 
     setBusy(true)
-    setNotice('')
+    clearNotice()
 
     try {
       await request(
@@ -562,9 +585,9 @@ function App() {
       )
 
       await refreshData()
-      setNotice('Workflow route updated successfully.')
+      showNotice('Workflow route updated successfully.')
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     } finally {
       setBusy(false)
     }
@@ -574,12 +597,12 @@ function App() {
     if (!selected || busy || !canProcess) return
 
     setBusy(true)
-    setNotice('')
+    clearNotice()
 
     try {
       const payload = {
-        due_date: dueDate || null,
-        document_expiry_date: expiryDate || null,
+        due_date: complianceDateDraft.dueDate || null,
+        document_expiry_date: complianceDateDraft.expiryDate || null,
       }
 
       await request(
@@ -589,9 +612,9 @@ function App() {
 
       await refreshData()
       await refreshDocuments()
-      setNotice('Compliance dates saved.')
+      showNotice('Compliance dates saved.')
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     } finally {
       setBusy(false)
     }
@@ -601,7 +624,7 @@ function App() {
     event.preventDefault()
     if (!selected || !canProcess || busy) return
     setBusy(true)
-    setNotice('')
+    clearNotice()
     try {
       await request(`/api/applications/${encodeURIComponent(selected.id)}/documents`, {
         method: 'POST',
@@ -613,9 +636,9 @@ function App() {
       setDocumentDraft({ document_type: '', name: '', expiry_date: '' })
       await refreshDocuments()
       await refreshData()
-      setNotice('Document added to the register.')
+      showNotice('Document added to the register.')
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     } finally {
       setBusy(false)
     }
@@ -624,7 +647,7 @@ function App() {
   async function updateDocument(documentId) {
     if (!canProcess || busy) return
     setBusy(true)
-    setNotice('')
+    clearNotice()
     const edit = documentEdits[documentId] || {}
     try {
       await request(`/api/applications/${encodeURIComponent(selected.id)}/documents/${documentId}`, {
@@ -637,9 +660,9 @@ function App() {
       })
       await refreshDocuments()
       await refreshData()
-      setNotice('Document record updated.')
+      showNotice('Document record updated.')
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     } finally {
       setBusy(false)
     }
@@ -649,7 +672,7 @@ function App() {
     if (!canProcess || busy) return
     const draft = renewalDrafts[document.id] || {}
     setBusy(true)
-    setNotice('')
+    clearNotice()
     try {
       await request(
         `/api/applications/${encodeURIComponent(document.application_id)}/documents/${document.id}/renewal`,
@@ -663,9 +686,9 @@ function App() {
         }
       )
       await refreshData()
-      setNotice('Renewal submitted for verification.')
+      showNotice('Renewal submitted for verification.')
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     } finally {
       setBusy(false)
     }
@@ -675,7 +698,7 @@ function App() {
     if (!canProcess || busy) return
     const draft = renewalDrafts[document.id] || {}
     setBusy(true)
-    setNotice('')
+    clearNotice()
     try {
       await request(
         `/api/applications/${encodeURIComponent(document.application_id)}/documents/${document.id}/renewal/verify`,
@@ -688,9 +711,9 @@ function App() {
         }
       )
       await refreshData()
-      setNotice(`Renewal ${decision.toLowerCase()}.`)
+      showNotice(`Renewal ${decision.toLowerCase()}.`)
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     } finally {
       setBusy(false)
     }
@@ -700,7 +723,7 @@ function App() {
     if (!canProcess || busy) return
     const draft = evcDrafts[evc.application_id] || {}
     setBusy(true)
-    setNotice('')
+    clearNotice()
     try {
       await request(`/api/applications/${encodeURIComponent(evc.application_id)}/evc/schedule`, {
         method: 'POST',
@@ -710,9 +733,9 @@ function App() {
         }),
       })
       await refreshData()
-      setNotice(evc.status === 'Pending Scheduling' ? 'EVC scheduled.' : 'EVC rescheduled.')
+      showNotice(evc.status === 'Pending Scheduling' ? 'EVC scheduled.' : 'EVC rescheduled.')
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     } finally {
       setBusy(false)
     }
@@ -722,16 +745,16 @@ function App() {
     if (!canProcess || busy) return
     const draft = evcDrafts[evc.application_id] || {}
     setBusy(true)
-    setNotice('')
+    clearNotice()
     try {
       await request(`/api/applications/${encodeURIComponent(evc.application_id)}/evc/complete`, {
         method: 'POST',
         body: JSON.stringify({ notes: draft.completion_notes || null }),
       })
       await refreshData()
-      setNotice('EVC marked as completed.')
+      showNotice('EVC marked as completed.')
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     } finally {
       setBusy(false)
     }
@@ -743,20 +766,20 @@ function App() {
       await request(`/api/notifications/${notificationId}/read`, { method: 'POST' })
       setNotifications((current) => current.filter((item) => item.id !== notificationId))
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     }
   }
 
   async function runComplianceCheck() {
     if (!isAdmin || busy) return
     setBusy(true)
-    setNotice('')
+    clearNotice()
     try {
       const result = await request('/api/compliance/check', { method: 'POST' })
       await refreshData()
-      setNotice(`Compliance check complete: ${result.created} new notification(s), ${result.escalated} escalation(s).`)
+      showNotice(`Compliance check complete: ${result.created} new notification(s), ${result.escalated} escalation(s).`)
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     } finally {
       setBusy(false)
     }
@@ -765,7 +788,7 @@ function App() {
   async function exportPendencyReport() {
     if (reportBusy) return
     setReportBusy(true)
-    setNotice('')
+    clearNotice()
     try {
       const result = await request('/api/reports/pendency.csv', {
         responseType: 'blob',
@@ -778,9 +801,9 @@ function App() {
       link.click()
       link.remove()
       window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0)
-      setNotice('Pendency report downloaded.')
+      showNotice('Pendency report downloaded.')
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     } finally {
       setReportBusy(false)
     }
@@ -791,7 +814,7 @@ function App() {
     if (!isAdmin || createBusy) return
 
     setCreateBusy(true)
-    setNotice('')
+    clearNotice()
     try {
       const payload = {
         ...newApplication,
@@ -818,9 +841,9 @@ function App() {
         requires_evc: false,
         requires_sac_shc: false,
       })
-      setNotice(`Application ${result.application.id} created. Assign its route automatically from the application panel.`)
+      showNotice(`Application ${result.application.id} created. Assign its route automatically from the application panel.`)
     } catch (error) {
-      setNotice(error.message)
+      showNotice(error.message, 'error')
     } finally {
       setCreateBusy(false)
     }
@@ -991,7 +1014,7 @@ function App() {
             aria-current={page === name ? 'page' : undefined}
             onClick={() => {
               setPage(name)
-              setNotice('')
+              clearNotice()
               setMobileNavOpen(false)
             }}
           >
@@ -1041,7 +1064,7 @@ function App() {
         </header>
 
         <section className="page-content">
-          {loading && <div className="notice">Loading backend data...</div>}
+          {loading && <div className="notice" role="status" aria-live="polite">Loading application data…</div>}
 
           <div className="page-heading">
             <div>
@@ -1056,9 +1079,13 @@ function App() {
           </div>
 
           {notice && (
-            <div className="notice" role="status">
+            <div
+              className={`notice notice-${noticeType}`}
+              role={noticeType === 'error' ? 'alert' : 'status'}
+              aria-live={noticeType === 'error' ? 'assertive' : 'polite'}
+            >
               <span>{notice}</span>
-              <button onClick={() => setNotice('')} aria-label="Dismiss">×</button>
+              <button type="button" onClick={clearNotice} aria-label="Dismiss notification">×</button>
             </div>
           )}
 
@@ -1077,7 +1104,7 @@ function App() {
                 <div className="panel dashboard-state" role="alert">
                   <strong>Dashboard analytics could not be loaded.</strong>
                   <p>{dashboardError}</p>
-                  <button className="secondary-button" onClick={() => refreshData().catch((error) => setNotice(error.message))}>
+                  <button className="secondary-button" onClick={() => refreshData().catch((error) => showNotice(error.message, 'error'))}>
                     Retry
                   </button>
                 </div>
@@ -1091,6 +1118,10 @@ function App() {
                   <DashboardSummary title="Risk distribution" data={riskSummary} />
                 </div>
               )}
+              <p className="dashboard-data-note">
+                Risk levels use the system’s configurable demo rules and are not official AICTE determinations.
+                Deadline indicators use recorded application dates and configured demo windows.
+              </p>
 
               <div className="dashboard-section-heading">
                 <div>
@@ -1116,13 +1147,13 @@ function App() {
                       <table className="dashboard-priority-table">
                         <thead>
                           <tr>
-                            <th>APPLICATION</th>
-                            <th>REGION</th>
-                            <th>STAGE</th>
-                            <th>DEADLINE</th>
-                            <th>RISK</th>
-                            <th>PRIORITY / REASON</th>
-                            <th />
+                            <th scope="col">APPLICATION</th>
+                            <th scope="col">REGION</th>
+                            <th scope="col">STAGE</th>
+                            <th scope="col">DEADLINE</th>
+                            <th scope="col">RISK</th>
+                            <th scope="col">PRIORITY / REASON</th>
+                            <th scope="col"><span className="sr-only">Actions</span></th>
                           </tr>
                         </thead>
                         <tbody>
@@ -1260,7 +1291,7 @@ function App() {
               </div>
 
               <ApplicationFilters search={search} setSearch={setSearch} filter={filter} setFilter={setFilter} />
-              <ApplicationTable rows={filtered} selectedId={selectedId} onSelect={setSelectedId} />
+              <ApplicationTable rows={filtered} selectedId={selectedId} onSelect={setSelectedId} loading={loading} />
             </>
           )}
 
@@ -1350,7 +1381,7 @@ function App() {
                 </form>
               )}
               <ApplicationFilters search={search} setSearch={setSearch} filter={filter} setFilter={setFilter} />
-              <ApplicationTable rows={filtered} selectedId={selectedId} onSelect={setSelectedId} />
+              <ApplicationTable rows={filtered} selectedId={selectedId} onSelect={setSelectedId} loading={loading} />
             </div>
           )}
 
@@ -1731,11 +1762,11 @@ function App() {
                   <table>
                     <thead>
                       <tr>
-                        <th>APPLICATION / INSTITUTION</th>
-                        <th>DOCUMENT</th>
-                        <th>DATES</th>
-                        <th>TRACKING STATUS</th>
-                        <th>RENEWAL ACTION</th>
+                        <th scope="col">APPLICATION / INSTITUTION</th>
+                        <th scope="col">DOCUMENT</th>
+                        <th scope="col">DATES</th>
+                        <th scope="col">TRACKING STATUS</th>
+                        <th scope="col">RENEWAL ACTION</th>
                       </tr>
                     </thead>
                     <tbody>
@@ -1820,7 +1851,7 @@ function App() {
             <div className="panel audit-page">
               <div className="section-heading">
                 <div><h2>Persistent audit trail</h2><p>Events loaded from the backend database.</p></div>
-                <button className="secondary-button" onClick={() => refreshData().catch((error) => setNotice(error.message))}>Refresh</button>
+                <button className="secondary-button" onClick={() => refreshData().catch((error) => showNotice(error.message, 'error'))}>Refresh</button>
               </div>
 
               {auditEvents.length === 0 ? (
@@ -1948,18 +1979,24 @@ function App() {
               <input
                 id="due-date"
                 type="date"
-                value={dueDate}
+                value={complianceDateDraft.dueDate}
                 disabled={!canProcess || busy}
-                onChange={(event) => setDueDate(event.target.value)}
+                onChange={(event) => setComplianceDateDraft((current) => ({
+                  ...current,
+                  dueDate: event.target.value,
+                }))}
               />
 
               <label htmlFor="expiry-date">Document expiry date</label>
               <input
                 id="expiry-date"
                 type="date"
-                value={expiryDate}
+                value={complianceDateDraft.expiryDate}
                 disabled={!canProcess || busy}
-                onChange={(event) => setExpiryDate(event.target.value)}
+                onChange={(event) => setComplianceDateDraft((current) => ({
+                  ...current,
+                  expiryDate: event.target.value,
+                }))}
               />
 
               {canProcess && (
@@ -2211,7 +2248,13 @@ function ApplicationFilters({ search, setSearch, filter, setFilter }) {
     <div className="filters">
       <div className="search-box">
         <span>⌕</span>
-        <input value={search} onChange={(event) => setSearch(event.target.value)} placeholder="Search ID, institution, officer..." />
+        <input
+          type="search"
+          value={search}
+          onChange={(event) => setSearch(event.target.value)}
+          placeholder="Search ID, institution, officer..."
+          aria-label="Search applications by ID, institution, officer, or region"
+        />
       </div>
       <select value={filter} onChange={(event) => setFilter(event.target.value)} aria-label="Filter by status">
         {['All', 'Pending', 'Under Review', 'Approved', 'Returned'].map((status) => (
@@ -2222,25 +2265,29 @@ function ApplicationFilters({ search, setSearch, filter, setFilter }) {
   )
 }
 
-function ApplicationTable({ rows, selectedId, onSelect }) {
+function ApplicationTable({ rows, selectedId, onSelect, loading = false }) {
   return (
-    <div className="table-wrap">
+    <div className="table-wrap" aria-busy={loading}>
       <table>
-        <thead><tr><th>APPLICATION / INSTITUTION</th><th>STAGE</th><th>OFFICER</th><th>STATUS</th><th /></tr></thead>
+        <thead><tr><th scope="col">APPLICATION / INSTITUTION</th><th scope="col">STAGE</th><th scope="col">OFFICER</th><th scope="col">STATUS</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
         <tbody>
           {rows.map((item) => (
             <tr key={item.id} className={selectedId === item.id ? 'selected-row' : ''}>
               <td>
-                <button className="application-link" onClick={() => onSelect(item.id)}>{item.id}</button>
+                <button type="button" className="application-link" onClick={() => onSelect(item.id)}>{item.id}</button>
                 <div className="institution-name">{item.institution}</div>
               </td>
               <td>{item.stage}</td>
               <td>{item.officer}<div className="institution-name">{item.region} Region</div></td>
               <td><Status status={item.status} /></td>
-              <td><button className="open-button" onClick={() => onSelect(item.id)} aria-label={`Review ${item.id}`}>→</button></td>
+              <td><button type="button" className="open-button" onClick={() => onSelect(item.id)} aria-label={`Review ${item.id}`}>→</button></td>
             </tr>
           ))}
-          {rows.length === 0 && <tr><td colSpan="5" className="empty-state">No applications match your search.</td></tr>}
+          {rows.length === 0 && (
+            <tr><td colSpan="5" className="empty-state" role="status">
+              {loading ? 'Loading applications…' : 'No applications match your search.'}
+            </td></tr>
+          )}
         </tbody>
       </table>
     </div>
