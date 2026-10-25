@@ -3,6 +3,7 @@ import tempfile
 import unittest
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -245,6 +246,176 @@ class DocumentComplianceTests(unittest.TestCase):
                 ).fetchall()
             ]
         self.assertCountEqual(categories, ["document_expiring", "document_expired"])
+
+    def test_dashboard_and_monitoring_use_configured_legacy_expiry_warning_window(self):
+        settings = json.loads(main.COMPLIANCE_SETTINGS_PATH.read_text(encoding="utf-8"))
+        settings["expiry_warning_days"] = 5
+        main.COMPLIANCE_SETTINGS_PATH.write_text(json.dumps(settings), encoding="utf-8")
+        today = date.today()
+        expiring = self.add_application(
+            "LEGACY-EXPIRY-5",
+            document_expiry_date=(today + timedelta(days=5)).isoformat(),
+        )
+        outside_window = self.add_application(
+            "LEGACY-EXPIRY-6",
+            document_expiry_date=(today + timedelta(days=6)).isoformat(),
+        )
+
+        with patch("main.local_date", return_value=today):
+            monitoring = self.client.get(
+                "/api/monitoring",
+                headers=self.login("viewer"),
+            )
+            dashboard = self.client.get(
+                "/api/dashboard",
+                headers=self.login("viewer"),
+            )
+
+        self.assertEqual(monitoring.status_code, 200)
+        by_id = {
+            item["id"]: item for item in monitoring.json()["applications"]
+        }
+        expiring_alerts = [
+            alert for alert in by_id[expiring["id"]]["alerts"]
+            if alert["type"] == "Document expiring"
+        ]
+        outside_alerts = [
+            alert for alert in by_id[outside_window["id"]]["alerts"]
+            if alert["type"] == "Document expiring"
+        ]
+        self.assertEqual(len(expiring_alerts), 1)
+        self.assertIn("5 days", expiring_alerts[0]["message"])
+        self.assertEqual(outside_alerts, [])
+        self.assertEqual(dashboard.status_code, 200)
+        self.assertEqual(dashboard.json()["expiring_soon_documents"], 1)
+
+    def test_compliance_date_update_creates_and_resolves_overdue_alert_with_audit(self):
+        application = self.add_application("DEADLINE-LIFECYCLE")
+        officer = self.login("officer")
+        overdue_date = (date.today() - timedelta(days=1)).isoformat()
+        created = self.client.patch(
+            f"/api/applications/{application['id']}/compliance",
+            headers=officer,
+            json={"due_date": overdue_date},
+        )
+        self.assertEqual(created.status_code, 200)
+        visible = self.client.get("/api/notifications", headers=officer)
+        self.assertEqual(visible.status_code, 200)
+        self.assertEqual(len(visible.json()["notifications"]), 1)
+        notification = visible.json()["notifications"][0]
+        self.assertEqual(notification["category"], "application_overdue")
+        self.assertIsNone(notification["resolved_at"])
+        missing_notification = self.client.post(
+            "/api/notifications/9999/read",
+            headers=officer,
+        )
+        self.assertEqual(missing_notification.status_code, 404)
+
+        viewed = self.client.post(
+            f"/api/notifications/{notification['id']}/read",
+            headers=officer,
+        )
+        self.assertEqual(viewed.status_code, 200)
+        self.assertEqual(
+            self.client.get("/api/notifications", headers=officer).json()["notifications"],
+            [],
+        )
+        self.assertEqual(
+            len(self.client.get(
+                "/api/notifications",
+                headers=self.login("admin"),
+            ).json()["notifications"]),
+            1,
+        )
+
+        corrected_date = (date.today() + timedelta(days=7)).isoformat()
+        corrected = self.client.patch(
+            f"/api/applications/{application['id']}/compliance",
+            headers=officer,
+            json={"due_date": corrected_date},
+        )
+        self.assertEqual(corrected.status_code, 200)
+        with main.connect_db() as connection:
+            notifications = connection.execute(
+                """
+                SELECT category, resolved_at FROM notifications
+                WHERE application_id = ? ORDER BY id
+                """,
+                (application["id"],),
+            ).fetchall()
+            resolved = connection.execute(
+                "SELECT resolved_at FROM notifications WHERE id = ?",
+                (notification["id"],),
+            ).fetchone()
+            audit = connection.execute(
+                """
+                SELECT action, actor, timestamp, details
+                FROM audit_events
+                WHERE application_id = ? AND action IN (
+                    'Compliance dates updated',
+                    'Notification created',
+                    'Notification resolved'
+                )
+                ORDER BY id
+                """,
+                (application["id"],),
+            ).fetchall()
+        self.assertIsNotNone(resolved["resolved_at"])
+        self.assertEqual(
+            [item["category"] for item in notifications],
+            ["application_overdue", "application_deadline_reminder"],
+        )
+        self.assertIsNotNone(notifications[0]["resolved_at"])
+        self.assertIsNone(notifications[1]["resolved_at"])
+        self.assertEqual(
+            [event["action"] for event in audit],
+            [
+                "Compliance dates updated",
+                "Notification created",
+                "Compliance dates updated",
+                "Notification created",
+                "Notification resolved",
+            ],
+        )
+        self.assertTrue(all(event["actor"] == "officer" for event in audit))
+        self.assertTrue(all(event["timestamp"] for event in audit))
+        self.assertIn(overdue_date, audit[0]["details"])
+        self.assertIn(corrected_date, audit[2]["details"])
+
+    def test_compliance_date_update_checks_role_application_and_date(self):
+        application = self.add_application("COMPLIANCE-VALIDATION")
+        endpoint = f"/api/applications/{application['id']}/compliance"
+        self.assertEqual(
+            self.client.patch(
+                endpoint,
+                headers=self.login("viewer"),
+                json={"due_date": date.today().isoformat()},
+            ).status_code,
+            403,
+        )
+        officer = self.login("officer")
+        self.assertEqual(
+            self.client.patch(
+                endpoint,
+                headers=officer,
+                json={"due_date": "not-a-date"},
+            ).status_code,
+            400,
+        )
+        self.assertEqual(
+            self.client.patch(
+                "/api/applications/DOES-NOT-EXIST/compliance",
+                headers=officer,
+                json={"due_date": date.today().isoformat()},
+            ).status_code,
+            404,
+        )
+        with main.connect_db() as connection:
+            events = connection.execute(
+                "SELECT COUNT(*) FROM audit_events WHERE application_id = ?",
+                (application["id"],),
+            ).fetchone()[0]
+        self.assertEqual(events, 0)
 
     def test_existing_documents_receive_safe_additive_renewal_migration(self):
         legacy_database = Path(self.database_directory.name) / "legacy.db"

@@ -1,5 +1,5 @@
 
-import { useCallback, useEffect, useMemo, useState } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
 const API = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '')
@@ -49,6 +49,13 @@ function App() {
   const [workflows, setWorkflows] = useState({})
   const [auditEvents, setAuditEvents] = useState([])
   const [monitoring, setMonitoring] = useState(null)
+  const [heatmap, setHeatmap] = useState(null)
+  const [heatmapMetric, setHeatmapMetric] = useState('applications')
+  const [heatmapLoading, setHeatmapLoading] = useState(false)
+  const [heatmapError, setHeatmapError] = useState('')
+  const [selectedHeatmapCell, setSelectedHeatmapCell] = useState(null)
+  const heatmapMetricRef = useRef('applications')
+  const heatmapRefreshRef = useRef({ promise: null, requested: false })
   const [notifications, setNotifications] = useState([])
   const [evcTracking, setEvcTracking] = useState({ evcs: [] })
   const [evcDrafts, setEvcDrafts] = useState({})
@@ -137,6 +144,56 @@ function App() {
     return data
   }, [token])
 
+  const refreshHeatmap = useCallback((metric = heatmapMetricRef.current) => {
+    heatmapMetricRef.current = metric
+    const refresh = heatmapRefreshRef.current
+    if (refresh.promise) {
+      refresh.requested = true
+      return refresh.promise
+    }
+
+    setHeatmapLoading(true)
+    setHeatmapError('')
+    refresh.promise = (async () => {
+      do {
+        refresh.requested = false
+        const requestedMetric = heatmapMetricRef.current
+        try {
+          const data = await request(
+            `/api/monitoring/heatmap?metric=${encodeURIComponent(requestedMetric)}`
+          )
+          if (requestedMetric !== heatmapMetricRef.current) continue
+          setHeatmap(data)
+          setSelectedHeatmapCell((current) => {
+            if (!current) return null
+            const region = data.regions.find((item) => item.key === current.key)
+            const cell = region?.cells.find((item) => item.stage === current.stage)
+            return cell
+              ? {
+                  key: current.key,
+                  region: region.label,
+                  stage: cell.stage,
+                  count: cell.count,
+                  applications: cell.applications,
+                }
+              : null
+          })
+          setHeatmapError('')
+        } catch (error) {
+          if (requestedMetric === heatmapMetricRef.current) {
+            setHeatmap(null)
+            setHeatmapError(error.message || 'Could not load the regional workflow heatmap.')
+          }
+        }
+      } while (refresh.requested)
+    })().finally(() => {
+      refresh.promise = null
+      setHeatmapLoading(false)
+    })
+
+    return refresh.promise
+  }, [request])
+
   const refreshData = useCallback(async () => {
     const [apps, workflowData, auditData, monitoringData, notificationData, evcData, trackingData, dashboardResult] =
       await Promise.all([
@@ -150,6 +207,7 @@ function App() {
         request('/api/dashboard')
           .then((data) => ({ data, error: '' }))
           .catch((error) => ({ data: null, error: error.message })),
+        refreshHeatmap(),
       ])
 
     setApplications(apps)
@@ -167,7 +225,7 @@ function App() {
       if (current && apps.some((item) => item.id === current)) return current
       return apps[0]?.id || ''
     })
-  }, [request])
+  }, [request, refreshHeatmap])
 
   // Validate an existing session when the page opens.
   useEffect(() => {
@@ -272,6 +330,9 @@ function App() {
     setWorkflows({})
     setAuditEvents([])
     setMonitoring(null)
+    setHeatmap(null)
+    setSelectedHeatmapCell(null)
+    setHeatmapError('')
     setNotifications([])
     setEvcTracking({ evcs: [] })
     setTrackedDocuments([])
@@ -1301,6 +1362,158 @@ function App() {
                 <Stat label="Document expiry alerts" value={monitoring ? expiryCount : '—'} note="Check validity" symbol="◷" />
                 <Stat label="Audit events" value={auditEvents.length} note="Persisted event log" symbol="≡" />
               </div>
+
+              <section className="panel regional-heatmap" aria-labelledby="regional-heatmap-title">
+                <div className="section-heading">
+                  <div>
+                    <h2 id="regional-heatmap-title">Regional workflow heatmap</h2>
+                    <p>Explore applications across recorded regions and configured workflow stages.</p>
+                  </div>
+                  <label className="heatmap-metric-select" htmlFor="heatmap-metric">
+                    Metric
+                    <select
+                      id="heatmap-metric"
+                      value={heatmapMetric}
+                      onChange={(event) => {
+                        const metric = event.target.value
+                        heatmapMetricRef.current = metric
+                        setHeatmapMetric(metric)
+                        refreshHeatmap(metric)
+                      }}
+                    >
+                      <option value="applications">Application count</option>
+                      <option value="overdue">Overdue applications</option>
+                      <option value="high_risk">High-risk applications</option>
+                    </select>
+                  </label>
+                </div>
+                <p className="heatmap-explanation">
+                  {heatmapMetric === 'applications'
+                    ? 'This shows workload only; a larger count does not indicate a compliance problem.'
+                    : heatmapMetric === 'overdue'
+                      ? 'Counts applications with a valid past due date that are not completed.'
+                      : 'Counts applications rated High or Critical by the configured rule-based risk assessment.'}
+                </p>
+                {heatmap && (
+                  <p className="heatmap-count-summary" aria-live="polite">
+                    {heatmap.metric_label}: <strong>{heatmap.matching_applications}</strong>
+                    {' '}of {heatmap.total_applications} total applications
+                  </p>
+                )}
+                <p className="heatmap-data-note">
+                  Region labels are shown as recorded. Current records use broad regional labels, not state-level locations; missing regions are kept separate.
+                </p>
+
+                {heatmapLoading && <div className="empty-state" role="status">Loading regional workflow data…</div>}
+                {!heatmapLoading && heatmapError && (
+                  <div className="heatmap-error" role="alert">{heatmapError}</div>
+                )}
+                {!heatmapLoading && !heatmapError && heatmap && heatmap.total_applications === 0 && (
+                  <div className="empty-state">No applications are available to display in the heatmap.</div>
+                )}
+                {!heatmapLoading && !heatmapError && heatmap && heatmap.total_applications > 0 && (
+                  <>
+                    <div className="heatmap-legend" aria-label="Heatmap color intensity legend">
+                      <span>Fewer</span>
+                      <span className="heatmap-legend-swatch heatmap-intensity-0">0</span>
+                      <span className={`heatmap-legend-swatch ${heatmapMetric === 'applications' ? 'heatmap-intensity-1' : 'heatmap-issue-intensity-1'}`}>1–25%</span>
+                      <span className={`heatmap-legend-swatch ${heatmapMetric === 'applications' ? 'heatmap-intensity-2' : 'heatmap-issue-intensity-2'}`}>26–50%</span>
+                      <span className={`heatmap-legend-swatch ${heatmapMetric === 'applications' ? 'heatmap-intensity-3' : 'heatmap-issue-intensity-3'}`}>51–75%</span>
+                      <span className={`heatmap-legend-swatch ${heatmapMetric === 'applications' ? 'heatmap-intensity-4' : 'heatmap-issue-intensity-4'}`}>76–100%</span>
+                      <span>More</span>
+                    </div>
+                    <div className="heatmap-scroll">
+                      <table className="heatmap-table">
+                        <thead>
+                          <tr>
+                            <th scope="col">REGION (AS RECORDED)</th>
+                            {heatmap.stages.map((stage) => <th scope="col" key={stage}>{stage}</th>)}
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {heatmap.regions.map((region) => (
+                            <tr key={region.key}>
+                              <th scope="row">
+                                {region.label}
+                                {region.is_unknown && <span className="heatmap-unknown-label">Missing location</span>}
+                              </th>
+                              {region.cells.map((cell) => {
+                                const intensity = cell.count === 0 || !heatmap.max_count
+                                  ? 0
+                                  : Math.min(4, Math.ceil((cell.count / heatmap.max_count) * 4))
+                                const selectedCell = selectedHeatmapCell?.key === region.key
+                                  && selectedHeatmapCell.stage === cell.stage
+                                const intensityClass = heatmapMetric === 'applications'
+                                  ? `heatmap-intensity-${intensity}`
+                                  : `heatmap-issue-intensity-${intensity}`
+                                return (
+                                  <td key={cell.stage}>
+                                    <button
+                                      type="button"
+                                      className={`heatmap-cell ${intensityClass} ${selectedCell ? 'heatmap-cell-selected' : ''}`}
+                                      aria-label={`${region.label}, ${cell.stage}: ${cell.count} ${heatmap.metric_label.toLowerCase()}`}
+                                      aria-pressed={selectedCell}
+                                      onClick={() => setSelectedHeatmapCell({
+                                        key: region.key,
+                                        region: region.label,
+                                        stage: cell.stage,
+                                        count: cell.count,
+                                        applications: cell.applications,
+                                      })}
+                                    >
+                                      {cell.count}
+                                    </button>
+                                  </td>
+                                )
+                              })}
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                    {selectedHeatmapCell && (
+                      <div className="heatmap-cell-details" aria-live="polite">
+                        <div className="section-heading">
+                          <div>
+                            <h3>{selectedHeatmapCell.region} · {selectedHeatmapCell.stage}</h3>
+                            <p>{selectedHeatmapCell.count} {heatmap.metric_label.toLowerCase()}</p>
+                          </div>
+                          <button
+                            className="close-button"
+                            type="button"
+                            aria-label="Close heatmap cell details"
+                            onClick={() => setSelectedHeatmapCell(null)}
+                          >×</button>
+                        </div>
+                        {selectedHeatmapCell.applications.length === 0 ? (
+                          <p className="muted">No applications match this region, stage, and metric.</p>
+                        ) : (
+                          <ul className="heatmap-application-list">
+                            {selectedHeatmapCell.applications.map((application) => (
+                              <li key={application.id}>
+                                <span>
+                                  <strong>{application.institution}</strong>
+                                  <small>{application.id} · {application.status}</small>
+                                </span>
+                                {applications.some((item) => item.id === application.id) && (
+                                  <button
+                                    className="application-link"
+                                    type="button"
+                                    onClick={() => {
+                                      setSelectedId(application.id)
+                                      setPage('Applications')
+                                    }}
+                                  >Open application</button>
+                                )}
+                              </li>
+                            ))}
+                          </ul>
+                        )}
+                      </div>
+                    )}
+                  </>
+                )}
+              </section>
 
               <div className="panel monitoring-panel">
                 <div className="section-heading">

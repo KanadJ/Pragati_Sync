@@ -1114,6 +1114,14 @@ def get_application_route(application):
     return stages
 
 
+def require_assigned_workflow_route(application):
+    if not application.get("workflow_route"):
+        raise HTTPException(
+            status_code=409,
+            detail="Assign a workflow route before processing this application.",
+        )
+
+
 def choose_workflow_route(application):
     try:
         with ROUTING_RULES_PATH.open(encoding="utf-8") as rules_file:
@@ -1861,6 +1869,7 @@ def complete_evc(
 @app.get("/api/dashboard")
 def dashboard(user=Depends(get_current_user)):
     applications = get_all_applications()
+    settings = get_compliance_settings()
     by_status = {}
     by_stage = {}
     by_region = {}
@@ -1894,7 +1903,7 @@ def dashboard(user=Depends(get_current_user)):
 
         if expiry and expiry < today:
             expired += 1
-        elif expiry and 0 <= (expiry - today).days <= 30:
+        elif expiry and 0 <= (expiry - today).days <= settings["expiry_warning_days"]:
             expiring_soon += 1
 
     with connect_db() as connection:
@@ -2403,11 +2412,14 @@ def compliance_monitoring(user=Depends(get_current_user)):
                 "type": "Document expired",
                 "message": "Document expired",
             })
-        elif expiry and 0 <= (expiry - today).days <= 30:
+        elif expiry and 0 <= (expiry - today).days <= settings["expiry_warning_days"]:
             alerts.append({
                 "severity": "Warning",
                 "type": "Document expiring",
-                "message": "Document expires within 30 days",
+                "message": (
+                    "Document expires within "
+                    f"{settings['expiry_warning_days']} days"
+                ),
             })
 
         documents = list_application_documents(application["id"])
@@ -2471,6 +2483,126 @@ def compliance_monitoring(user=Depends(get_current_user)):
         "total_applications": len(results),
         "risk_summary": risk_summary,
         "applications": results,
+    }
+
+
+@app.get("/api/monitoring/heatmap")
+def workflow_heatmap(metric: str = "applications", user=Depends(get_current_user)):
+    metric_labels = {
+        "applications": "Applications",
+        "overdue": "Overdue applications",
+        "high_risk": "High-risk applications",
+    }
+    if metric not in metric_labels:
+        raise HTTPException(
+            status_code=400,
+            detail="Metric must be applications, overdue, or high_risk",
+        )
+
+    applications = get_all_applications()
+    configured_stages = list(dict.fromkeys(
+        stage
+        for route in WORKFLOW_ROUTES.values()
+        for stage in route
+    ))
+    configured_stage_set = set(configured_stages)
+    region_labels = {}
+    categorized_applications = []
+    has_unknown_stage = False
+
+    for application in applications:
+        region = application.get("region")
+        if isinstance(region, str) and region.strip():
+            region = region.strip()
+            region_key = f"region:{region.casefold()}"
+            region_labels.setdefault(region_key, region)
+        else:
+            region_key = "unknown"
+            region_labels[region_key] = "Unknown / missing region"
+
+        stage = application.get("stage")
+        if isinstance(stage, str) and stage.strip() in configured_stage_set:
+            stage = stage.strip()
+        else:
+            stage = "Unknown stage"
+            has_unknown_stage = True
+        categorized_applications.append((application, region_key, stage))
+
+    regions = sorted(
+        region_labels,
+        key=lambda key: (key == "unknown", region_labels[key].casefold()),
+    )
+    stages = configured_stages + (["Unknown stage"] if has_unknown_stage else [])
+    cells = {
+        (region_key, stage): []
+        for region_key in regions
+        for stage in stages
+    }
+    today = local_date()
+    if metric == "high_risk":
+        settings = get_compliance_settings()
+        stage_entries = get_stage_entry_timestamps()
+
+    for application, region_key, stage in categorized_applications:
+        include_application = metric == "applications"
+        if metric == "overdue":
+            due_date = parse_date(application.get("due_date"))
+            include_application = (
+                due_date is not None
+                and due_date < today
+                and not is_completed(application)
+            )
+        elif metric == "high_risk":
+            risk = calculate_workflow_risk(
+                application,
+                list_application_documents(application["id"]),
+                settings,
+                stage_entries.get((application["id"], application.get("stage"))),
+                today,
+            )
+            include_application = risk["risk_level"] in {"High", "Critical"}
+
+        if include_application:
+            cells[(region_key, stage)].append({
+                "id": application["id"],
+                "institution": application.get("institution") or "Institution unavailable",
+                "region": application.get("region"),
+                "stage": application.get("stage"),
+                "status": application.get("status") or "Unknown",
+            })
+
+    rows = [
+        {
+            "key": region_key,
+            "label": region_labels[region_key],
+            "is_unknown": region_key == "unknown",
+            "cells": [
+                {
+                    "stage": stage,
+                    "count": len(cells[(region_key, stage)]),
+                    "applications": cells[(region_key, stage)],
+                }
+                for stage in stages
+            ],
+        }
+        for region_key in regions
+    ]
+    matching_applications = sum(
+        cell["count"]
+        for row in rows
+        for cell in row["cells"]
+    )
+    return {
+        "metric": metric,
+        "metric_label": metric_labels[metric],
+        "total_applications": len(applications),
+        "matching_applications": matching_applications,
+        "regions": rows,
+        "stages": stages,
+        "max_count": max(
+            (cell["count"] for row in rows for cell in row["cells"]),
+            default=0,
+        ),
     }
 
 
@@ -2698,6 +2830,7 @@ def advance_application(
     user=Depends(require_roles("Admin", "Officer")),
 ):
     application = find_application(application_id)
+    require_assigned_workflow_route(application)
     stages = get_application_route(application)
     current_stage = application["stage"]
 
@@ -2767,6 +2900,7 @@ def return_application(
         raise HTTPException(status_code=400, detail="An approved application cannot be returned")
     if application.get("status") == "Returned":
         raise HTTPException(status_code=400, detail="Application has already been returned")
+    require_assigned_workflow_route(application)
 
     reason = reason.strip()
     application["status"] = "Returned"

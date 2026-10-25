@@ -956,7 +956,7 @@ class WorkflowAutomationTests(unittest.TestCase):
         )
 
     def test_return_requires_reason_resubmission_then_workflow_continues(self):
-        self.add_application("TEST-RETURN")
+        self.add_application("TEST-RETURN", workflow_route="STANDARD")
         headers = self.login("officer")
         returned = self.client.post(
             "/api/applications/TEST-RETURN/return",
@@ -964,12 +964,15 @@ class WorkflowAutomationTests(unittest.TestCase):
             json={"reason": "  Provide the signed lease.  "},
         )
         self.assertEqual(returned.status_code, 200)
-        self.assertEqual(returned.json()["application"]["reason"], "Provide the signed lease.")
+        returned_application = returned.json()["application"]
+        self.assertEqual(returned_application["reason"], "Provide the signed lease.")
+        self.assertEqual(returned_application["status"], "Returned")
+        self.assertEqual(returned_application["stage"], "Application Review")
 
         missing_reason = self.client.post(
             "/api/applications/TEST-RETURN/return",
             headers=headers,
-            json={"reason": " "},
+            json={},
         )
         self.assertEqual(missing_reason.status_code, 400)
 
@@ -1011,6 +1014,107 @@ class WorkflowAutomationTests(unittest.TestCase):
         self.assertIn("Provide the signed lease.", history[1]["details"])
         self.assertTrue(all(event["actor"] == "officer" for event in history))
         self.assertTrue(all(event["timestamp"] for event in history))
+        return_audit = next(
+            event for event in history
+            if event["action"] == "Application returned"
+        )
+        self.assertEqual(return_audit["stage"], "Application Review")
+        self.assertEqual(return_audit["actor"], "officer")
+        self.assertTrue(return_audit["timestamp"])
+
+        with main.connect_db() as connection:
+            audit_row = connection.execute(
+                """
+                SELECT action, stage, details, timestamp, actor
+                FROM audit_events
+                WHERE application_id = ? AND action = 'Application returned'
+                """,
+                ("TEST-RETURN",),
+            ).fetchone()
+        self.assertIsNotNone(audit_row)
+        self.assertEqual(audit_row["stage"], "Application Review")
+        self.assertEqual(audit_row["actor"], "officer")
+        self.assertIn("Provide the signed lease.", audit_row["details"])
+        self.assertTrue(audit_row["timestamp"])
+
+    def test_unassigned_application_cannot_be_processed_before_route_assignment(self):
+        admin = self.login("admin")
+        created = self.client.post(
+            "/api/applications",
+            headers=admin,
+            json=self.create_payload("TEST-UNROUTED"),
+        )
+        self.assertEqual(created.status_code, 201)
+
+        officer = self.login("officer")
+        returned = self.client.post(
+            "/api/applications/TEST-UNROUTED/return",
+            headers=officer,
+            json={"reason": "Provide the missing document"},
+        )
+        self.assertEqual(returned.status_code, 409)
+        advanced = self.client.post(
+            "/api/applications/TEST-UNROUTED/advance",
+            headers=officer,
+        )
+        self.assertEqual(advanced.status_code, 409)
+
+        unchanged = main.find_application("TEST-UNROUTED")
+        self.assertIsNone(unchanged["workflow_route"])
+        self.assertEqual(unchanged["status"], "Pending")
+        self.assertEqual(
+            self.audit_actions("TEST-UNROUTED"),
+            ["Application created"],
+        )
+
+        routed = self.client.post(
+            "/api/applications/TEST-UNROUTED/auto-route",
+            headers=admin,
+        )
+        self.assertEqual(routed.status_code, 200)
+        allowed_return = self.client.post(
+            "/api/applications/TEST-UNROUTED/return",
+            headers=officer,
+            json={"reason": "Provide the missing document"},
+        )
+        self.assertEqual(allowed_return.status_code, 200)
+
+    def test_return_rejects_missing_application_and_completed_application(self):
+        officer = self.login("officer")
+        missing = self.client.post(
+            "/api/applications/DOES-NOT-EXIST/return",
+            headers=officer,
+            json={"reason": "Please correct the application"},
+        )
+        self.assertEqual(missing.status_code, 404)
+
+        self.add_application(
+            "TEST-COMPLETED",
+            workflow_route="STANDARD",
+            stage="Completed",
+            status="Approved",
+        )
+        completed = self.client.post(
+            "/api/applications/TEST-COMPLETED/return",
+            headers=officer,
+            json={"reason": "Please correct the application"},
+        )
+        self.assertEqual(completed.status_code, 400)
+        cannot_advance = self.client.post(
+            "/api/applications/TEST-COMPLETED/advance",
+            headers=officer,
+        )
+        self.assertEqual(cannot_advance.status_code, 400)
+
+    def test_admin_can_return_application_with_assigned_route(self):
+        self.add_application("TEST-ADMIN-RETURN", workflow_route="STANDARD")
+        returned = self.client.post(
+            "/api/applications/TEST-ADMIN-RETURN/return",
+            headers=self.login("admin"),
+            json={"reason": "Please correct the submitted details"},
+        )
+        self.assertEqual(returned.status_code, 200)
+        self.assertEqual(returned.json()["application"]["status"], "Returned")
 
     def test_route_cannot_be_changed_after_processing_or_audit_history(self):
         self.add_application("TEST-LOCK")
