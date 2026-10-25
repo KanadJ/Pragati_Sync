@@ -991,11 +991,7 @@ function App() {
       )}
       <aside className={`sidebar ${mobileNavOpen ? 'sidebar-open' : ''}`} aria-label="Main navigation">
         <div className="brand">
-          <div className="brand-mark" aria-hidden="true">A</div>
-          <div>
-            <strong>AICTE Portal</strong>
-            <span>Approval &amp; Compliance</span>
-          </div>
+          <img className="brand-logo" src="/pragatisync-logo.jpeg" alt="PragatiSync" />
         </div>
 
         <div className="nav-label">WORKSPACE</div>
