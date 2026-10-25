@@ -64,6 +64,7 @@ h1 { font-size: 27px; letter-spacing: -.7px; margin-bottom: 8px; font-weight: 75
 .login-intro { position: relative; min-height: 620px; display: flex; flex-direction: column; justify-content: space-between; padding: 42px; color: #fff; background: linear-gradient(145deg, #163d68, #215d92); isolation: isolate; }
 .login-intro::after { position: absolute; z-index: -1; right: -105px; bottom: 82px; width: 360px; height: 360px; border: 1px solid rgb(255 255 255 / 11%); border-radius: 50%; content: ""; box-shadow: 0 0 0 42px rgb(255 255 255 / 3%), 0 0 0 84px rgb(255 255 255 / 2%); }
 .login-brand-lockup { display: flex; align-items: center; gap: 12px; }
+.login-brand-logo { display: block; width: min(280px, 100%); max-width: 100%; height: auto; object-fit: contain; }
 .login-brand-lockup > div:last-child { display: grid; gap: 5px; }
 .login-brand-lockup strong { font-size: 13px; line-height: 1.4; }
 .login-brand-lockup span { color: rgb(255 255 255 / 70%); font-size: 11px; }

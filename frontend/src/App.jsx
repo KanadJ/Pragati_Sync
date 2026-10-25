@@ -876,11 +876,7 @@ function App() {
       <div className="login-shell">
         <main className="login-layout">
           <div className="login-brand-lockup">
-            <div className="brand-mark" aria-hidden="true">A</div>
-            <div>
-              <strong>AICTE Approval &amp; Compliance</strong>
-              <span>Institutional workflow workspace</span>
-            </div>
+            <img className="login-brand-logo" src="/pragatisync-logo.jpeg" alt="PragatiSync" />
           </div>
           <div className="login-card login-card-loading" role="status" aria-live="polite">
             <span className="login-eyebrow">SECURE WORKSPACE</span>
@@ -899,11 +895,7 @@ function App() {
         <main className="login-layout">
           <section className="login-intro" aria-labelledby="login-product-name">
             <div className="login-brand-lockup">
-              <div className="brand-mark" aria-hidden="true">A</div>
-              <div>
-                <strong>AICTE Approval &amp; Compliance</strong>
-                <span>Institutional workflow workspace</span>
-              </div>
+              <img className="login-brand-logo" src="/pragatisync-logo.jpeg" alt="PragatiSync" />
             </div>
             <div className="login-intro-copy">
               <span className="login-eyebrow">APPROVAL WORKFLOW · COMPLIANCE MONITORING</span>
