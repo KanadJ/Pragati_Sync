@@ -10,10 +10,14 @@ application records and audit events in SQLite (`backend/aicte.db`).
 
 ## Authentication and authorization
 
-The API uses bearer tokens issued by `POST /api/auth/login`. Tokens are held
-in server memory and become invalid when the backend process restarts. Login
-is required for application, workflow, dashboard, history, audit, and
-compliance-monitoring reads.
+The browser opens directly into the dashboard and requests a server-issued
+demo session from `POST /api/auth/demo-session`; no username or password is
+requested by the frontend. The backend continues to require a bearer token
+for application, workflow, dashboard, history, audit, and
+compliance-monitoring reads. Demo sessions are held in server memory and
+become invalid when the backend process restarts. The separate
+`POST /api/auth/login` API remains available for password-authenticated
+clients.
 
 - **Admin:** read access; may configure application workflow routes and perform
   application processing and compliance updates.
@@ -30,11 +34,11 @@ data. The root and health-check endpoints remain public.
 
 ### Dashboard-first hackathon demo mode
 
-The passwordless demo entry flow is opt-in. Set
-`VITE_PRAGATISYNC_DEMO_MODE=true` in the frontend build environment and set
-both `PRAGATISYNC_ENVIRONMENT=demo` and
-`PRAGATISYNC_DEMO_MODE_ENABLED=true` in the backend environment. With the
-frontend flag disabled, the existing password-login flow remains unchanged.
+The dashboard-first frontend always uses the demo-session API. Set both
+`PRAGATISYNC_ENVIRONMENT=demo` and
+`PRAGATISYNC_DEMO_MODE_ENABLED=true` in the backend environment to allow
+demo sessions. Without both backend settings, the app shows a connection
+error and a retry option rather than a login page.
 
 For local development, start the frontend with `npm run dev:demo` from
 `frontend/`; create a demo production bundle with `npm run build:demo`.
@@ -43,8 +47,8 @@ default at `http://127.0.0.1:8000`. Set `VITE_API_URL` in the build
 environment to the reachable backend URL when using another server. The
 backend must still be started with both demo environment gates enabled.
 
-When enabled, the frontend requests a server-issued Viewer session on startup;
-the header selector can request Admin, Officer, or Viewer sessions through
+The frontend requests a server-issued Viewer session on startup; the visible
+**Demo Role** selector can request Admin, Officer, or Viewer sessions through
 `POST /api/auth/demo-session`. The backend accepts only those roles, stores
 the role in its in-memory session, updates the current demo session when
 switching roles, and continues applying the existing endpoint role checks.
@@ -52,9 +56,9 @@ Demo sessions are rejected if the backend demo gates are disabled.
 
 This mode intentionally does not authenticate a person's identity: anyone
 who can reach a demo-enabled backend can select any demo role, including
-Admin. It is an authentication bypass for an isolated, non-production
-hackathon environment, not production authentication. Keep the backend gates
-disabled outside that environment and use non-sensitive demo data.
+Admin. The selector is a demonstration convenience, not production
+authorization. Keep the backend gates disabled outside an isolated,
+non-production environment and use non-sensitive demo data.
 
 ## Workflow routing and application processing
 
@@ -268,20 +272,12 @@ and per-user `notification_views` tables and their indexes are created
 idempotently at startup; existing application, notification, and audit records
 are preserved, and this feature requires no database reset.
 
-## Demo accounts
+## Demo account behavior
 
-These fixed credentials are for the existing password-login flow only. The
-dashboard-first demo mode does not use or require them:
-
-| Role | Username | Password |
-| --- | --- | --- |
-| Admin | `admin` | `Admin@26262` |
-| Officer | `officer` | `Officer@26262` |
-| Viewer | `viewer` | `Viewer@26262` |
-
-Do not deploy the demo accounts or passwords to a production environment.
-Production use requires managed identity, configurable secrets, and an
-appropriate session lifecycle.
+The browser dashboard does not request or use username/password credentials.
+The legacy password-login API is separate from the dashboard-first demo
+interface. Production use requires managed identity, configurable secrets,
+and an appropriate session lifecycle.
 
 ## Temporary Render demo configuration
 
