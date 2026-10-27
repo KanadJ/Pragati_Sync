@@ -1,25 +1,25 @@
 
 :root {
   font-family: Inter, "Segoe UI", Arial, sans-serif;
-  color: #1d2b39;
-  background: #f4f7f7;
+  color: #1d3042;
+  background: #f3f4f1;
   font-synthesis: none;
   text-rendering: optimizeLegibility;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
   font-optical-sizing: auto;
 
-  --color-ink: #1d2b39;
-  --color-ink-soft: #526473;
-  --color-muted: #7b8993;
-  --color-primary: #087f75;
-  --color-primary-strong: #06665f;
-  --color-primary-soft: #e8f5f2;
+  --color-ink: #1d3042;
+  --color-ink-soft: #526577;
+  --color-muted: #78868e;
+  --color-primary: #147c78;
+  --color-primary-strong: #0e625f;
+  --color-primary-soft: #e8f2ef;
   --color-surface: #ffffff;
-  --color-page: #f4f7f7;
-  --color-border: #e2e9e9;
-  --color-border-strong: #ccd8d8;
-  --color-focus: #15968a;
+  --color-page: #f3f4f1;
+  --color-border: #e2e6e2;
+  --color-border-strong: #cbd4d2;
+  --color-focus: #147c78;
 
   --font-size-xs: 0.6875rem;
   --font-size-sm: 0.8125rem;
@@ -38,8 +38,8 @@
   --radius-sm: 0.4375rem;
   --radius-md: 0.6875rem;
   --radius-lg: 0.875rem;
-  --shadow-panel: 0 2px 8px rgb(23 45 53 / 4%);
-  --focus-ring: 0 0 0 3px rgb(21 150 138 / 19%);
+  --shadow-panel: 0 1px 3px rgb(24 43 52 / 4%);
+  --focus-ring: 0 0 0 3px rgb(20 124 120 / 18%);
 }
 
 * {
@@ -77,5 +77,5 @@ button:disabled {
 
 ::selection {
   color: var(--color-primary-strong);
-  background: #d9e9fa;
+  background: #dcece8;
 }

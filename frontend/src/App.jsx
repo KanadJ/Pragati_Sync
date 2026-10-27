@@ -1145,16 +1145,20 @@ function App() {
             <div className="breadcrumb"><span className="breadcrumb-root">AICTE WORKSPACE</span><span className="breadcrumb-separator">/</span>{page}</div>
           </div>
           <div className={`user-chip ${DEMO_MODE ? 'demo-user-chip' : ''}`}>
-            <div className="avatar" aria-hidden="true">{(user.username || 'U').slice(0, 2).toUpperCase()}</div>
-            <div className="user-identity">
-              <strong>{DEMO_MODE ? 'Demo session' : user.username}</strong>
-              {!DEMO_MODE && <span className="role-label">{role}</span>}
-            </div>
+            {!DEMO_MODE && (
+              <>
+                <div className="avatar" aria-hidden="true">{(user.username || 'U').slice(0, 2).toUpperCase()}</div>
+                <div className="user-identity">
+                  <strong>{user.username}</strong>
+                  <span className="role-label">{role}</span>
+                </div>
+              </>
+            )}
             {DEMO_MODE ? (
               <label className="demo-role-control">
-                <span>Demo role</span>
+                <span className="sr-only">Role</span>
                 <select
-                  aria-label="Demo role"
+                  aria-label="Role"
                   value={role}
                   disabled={roleSwitchBusy}
                   onChange={(event) => handleDemoRoleChange(event.target.value)}
@@ -1197,7 +1201,7 @@ function App() {
           )}
 
           {page === 'Dashboard' && (
-            <>
+            <div className="dashboard-view">
               <div className="stats-grid dashboard-kpi-grid">
                 <Stat label="Total applications" value={dashboardData?.total_applications ?? '—'} note="All recorded applications" symbol="▤" />
                 <Stat label="Pending action" value={dashboardData?.pending_requests ?? '—'} note="Includes returned applications" symbol="◷" />
@@ -1219,7 +1223,7 @@ function App() {
                 <div className="panel dashboard-state" role="status">Loading dashboard analytics...</div>
               ) : (
                 <div className="dashboard-distribution-grid">
-                  <DashboardSummary title="Applications by region" data={dashboardData.by_region} />
+                  <DashboardSummary title="Regional overview" data={dashboardData.by_region} />
                   <DashboardSummary title="Workflow stages" data={dashboardData.by_stage} />
                   <DashboardSummary title="Assigned officer workload" data={dashboardData.by_officer} />
                   <DashboardSummary title="Risk distribution" data={riskSummary} />
@@ -1232,8 +1236,8 @@ function App() {
 
               <div className="dashboard-section-heading">
                 <div>
-                  <h2>Priority applications</h2>
-                  <p>Ordered by overdue deadlines, high or critical risk, then document expiry alerts.</p>
+                  <h2>Upcoming &amp; overdue compliance</h2>
+                  <p>Recorded deadlines, document alerts, and elevated risks ranked for review.</p>
                 </div>
                 <span className="record-count">{priorityApplications.length} priority records</span>
               </div>
@@ -1399,7 +1403,7 @@ function App() {
 
               <ApplicationFilters search={search} setSearch={setSearch} filter={filter} setFilter={setFilter} />
               <ApplicationTable rows={filtered} selectedId={selectedId} onSelect={setSelectedId} loading={loading} />
-            </>
+            </div>
           )}
 
           {page === 'Applications' && (
