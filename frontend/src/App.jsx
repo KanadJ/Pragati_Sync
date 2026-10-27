@@ -3,8 +3,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
 const API = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '')
-const DEMO_MODE = import.meta.env.VITE_PRAGATISYNC_DEMO_MODE === 'true'
 const TOKEN_KEY = 'aicte_demo_token'
+const AVAILABLE_ROLES = ['Admin', 'Officer', 'Viewer']
 
 const FALLBACK_STAGES = [
   'Application Review',
@@ -35,17 +35,11 @@ function formatKolkataTimestamp(value, includeTime = true) {
 }
 
 function App() {
-  const [token, setToken] = useState(() => (
-    DEMO_MODE ? '' : localStorage.getItem(TOKEN_KEY) || ''
-  ))
+  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || '')
   const [user, setUser] = useState(null)
-  const [authChecking, setAuthChecking] = useState(true)
-  const [demoSessionError, setDemoSessionError] = useState('')
-  const [username, setUsername] = useState('')
-  const [password, setPassword] = useState('')
-  const [showPassword, setShowPassword] = useState(false)
-  const [loginBusy, setLoginBusy] = useState(false)
-  const [loginError, setLoginError] = useState('')
+  const [sessionConnecting, setSessionConnecting] = useState(true)
+  const [sessionError, setSessionError] = useState('')
+  const [sessionRetry, setSessionRetry] = useState(0)
   const [roleSwitchBusy, setRoleSwitchBusy] = useState(false)
 
   const [applications, setApplications] = useState([])
@@ -159,7 +153,6 @@ function App() {
 
     if (
       response.status === 401
-      && path !== '/api/auth/login'
       && path !== '/api/auth/demo-session'
     ) {
       localStorage.removeItem(TOKEN_KEY)
@@ -268,88 +261,66 @@ function App() {
     })
   }, [request, refreshHeatmap])
 
-  // Validate an existing session when the page opens.
+  // Reuse a valid demo session or create a Viewer session on startup.
   useEffect(() => {
     let active = true
 
-    async function checkSession() {
-      if (DEMO_MODE) {
-        const savedToken = localStorage.getItem(TOKEN_KEY)
-        if (savedToken) {
-          try {
-            const data = await request('/api/auth/me')
-            if (!active) return
-            if (data.demo_mode === true) {
-              setToken(savedToken)
-              setUser(data)
-              setDemoSessionError('')
-              setAuthChecking(false)
-              return
-            }
-          } catch {
-            if (!active) return
-          }
-        }
-
-        localStorage.removeItem(TOKEN_KEY)
-        setToken('')
-        try {
-          const data = await request('/api/auth/demo-session', {
-            method: 'POST',
-            body: JSON.stringify({ role: 'Viewer' }),
-            skipAuth: true,
-          })
-          if (!active) return
-          if (!data.access_token || data.user?.role !== 'Viewer') {
-            throw new Error('The backend did not create a Viewer demo session.')
-          }
-          localStorage.setItem(TOKEN_KEY, data.access_token)
-          setToken(data.access_token)
-          setUser(data.user)
-          setDemoSessionError('')
-        } catch (error) {
-          if (!active) return
-          setDemoSessionError(error.message || 'Could not start the demo session.')
-        } finally {
-          if (active) {
-            setAuthChecking(false)
-            setLoading(false)
-          }
-        }
-        return
-      }
-
+    async function connectDemoSession() {
       const savedToken = localStorage.getItem(TOKEN_KEY)
 
-      if (!savedToken) {
-        setAuthChecking(false)
-        setLoading(false)
-        return
+      if (savedToken) {
+        try {
+          const data = await request('/api/auth/me')
+          if (!active) return
+          if (data.demo_mode === true && AVAILABLE_ROLES.includes(data.role)) {
+            setToken(savedToken)
+            setUser(data)
+            setSessionError('')
+            setSessionConnecting(false)
+            return
+          }
+        } catch {
+          if (!active) return
+        }
       }
 
+      localStorage.removeItem(TOKEN_KEY)
+      if (active) setToken('')
+
       try {
-        const data = await request('/api/auth/me')
+        const data = await request('/api/auth/demo-session', {
+          method: 'POST',
+          body: JSON.stringify({ role: 'Viewer' }),
+          skipAuth: true,
+        })
         if (!active) return
-        setToken(savedToken)
-        setUser(data.user || data)
-      } catch {
-        if (!active) return
-        localStorage.removeItem(TOKEN_KEY)
-        setToken('')
-        setUser(null)
+        if (!data.access_token || data.user?.role !== 'Viewer') {
+          throw new Error('The backend did not create a Viewer demo session.')
+        }
+        localStorage.setItem(TOKEN_KEY, data.access_token)
+        setToken(data.access_token)
+        setUser(data.user)
+        setSessionError('')
+      } catch (error) {
+        if (active) {
+          setSessionError(error.message || 'Could not connect to the demo workspace.')
+        }
       } finally {
-        if (active) setAuthChecking(false)
+        if (active) {
+          setSessionConnecting(false)
+          setLoading(false)
+        }
       }
     }
 
-    checkSession()
+    connectDemoSession()
 
     return () => {
       active = false
     }
-  }, [request])
+  }, [request, sessionRetry])
 
-  // Load application data only after authentication.
+  // Load application data after a demo session is available.
   useEffect(() => {
     if (!user || !token) return
 
@@ -369,37 +340,7 @@ function App() {
     }
   }, [user, token, refreshData, showNotice])
 
-  async function handleLogin(event) {
-    event.preventDefault()
-    setLoginBusy(true)
-    setLoginError('')
-
-    try {
-      const data = await request('/api/auth/login', {
-        method: 'POST',
-        body: JSON.stringify({ username: username.trim(), password }),
-      })
-
-      if (!data.access_token) {
-        throw new Error('The server did not return an access token.')
-      }
-
-      localStorage.setItem(TOKEN_KEY, data.access_token)
-      setLoading(true)
-      setToken(data.access_token)
-      setUser(data.user)
-      setPassword('')
-      setPage('Dashboard')
-      clearNotice()
-    } catch (error) {
-      setLoginError(error.message || 'Login failed.')
-    } finally {
-      setLoginBusy(false)
-      setAuthChecking(false)
-    }
-  }
-
-  async function handleDemoRoleChange(nextRole) {
+  async function handleRoleChange(nextRole) {
     setRoleSwitchBusy(true)
     try {
       const data = await request('/api/auth/demo-session', {
@@ -415,41 +356,13 @@ function App() {
       setUser(data.user)
       clearNotice()
     } catch (error) {
-      showNotice(`Could not switch demo role: ${error.message}`, 'error')
+      const message = error instanceof TypeError
+        ? `Cannot reach ${API}. Check VITE_API_URL and confirm the FastAPI demo backend is running.`
+        : error.message
+      showNotice(`Could not switch demo role: ${message}`, 'error')
     } finally {
       setRoleSwitchBusy(false)
     }
-  }
-
-  async function handleLogout() {
-    try {
-      await request('/api/auth/logout', { method: 'POST' })
-    } catch {
-      // Clear the local session even if the server is unavailable.
-    }
-
-    localStorage.removeItem(TOKEN_KEY)
-    setToken('')
-    setUser(null)
-    setApplications([])
-    setDashboardData(null)
-    setDashboardError('')
-    setWorkflows({})
-    setAuditEvents([])
-    setMonitoring(null)
-    setHeatmap(null)
-    setSelectedHeatmapCell(null)
-    setHeatmapError('')
-    setNotifications([])
-    setEvcTracking({ evcs: [] })
-    setTrackedDocuments([])
-    setDocuments([])
-    setComplianceSummary(null)
-    setSelectedId('')
-    setShowReturn(false)
-    clearNotice()
-    setLoginError('')
-    setPage('Dashboard')
   }
 
   const refreshDocuments = useCallback(async () => {
@@ -948,129 +861,38 @@ function App() {
         ? 'This application already has audit history and its route is locked.'
         : ''
 
-  if (authChecking) {
-    if (DEMO_MODE) {
-      return (
-        <main className="demo-session-status" role="status" aria-live="polite">
-          <div className="panel">
-            <img className="demo-session-logo" src="/pragatisync-logo.jpeg" alt="PragatiSync" />
-            <strong>Connecting to the configured demo workspace…</strong>
-          </div>
-        </main>
-      )
-    }
-
+  if (sessionConnecting || !user || !token) {
     return (
-      <div className="login-shell">
-        <main className="login-layout">
-          <div className="login-brand-lockup">
-            <img className="login-brand-logo" src="/pragatisync-logo.jpeg" alt="PragatiSync" />
-          </div>
-          <div className="login-card login-card-loading" role="status" aria-live="polite">
-            <span className="login-eyebrow">SECURE WORKSPACE</span>
-            <h1>Checking your session</h1>
-            <p className="muted">Please wait while we verify your access.</p>
-            <div className="login-loading-line" aria-hidden="true" />
-          </div>
-        </main>
-      </div>
-    )
-  }
-
-  if (!user || !token) {
-    if (DEMO_MODE) {
-      return (
-        <main className="demo-session-status" role="alert">
-          <div className="panel">
-            <img className="demo-session-logo" src="/pragatisync-logo.jpeg" alt="PragatiSync" />
-            <h1>Demo workspace unavailable</h1>
-            <p>{demoSessionError || 'A demo session could not be created.'}</p>
-            <p className="muted">
-              Enable the frontend demo flag and both backend demo environment settings, then refresh.
-            </p>
-          </div>
-        </main>
-      )
-    }
-
-    return (
-      <div className="login-shell">
-        <main className="login-layout">
-          <section className="login-intro" aria-labelledby="login-product-name">
-            <div className="login-brand-lockup">
-              <img className="login-brand-logo" src="/pragatisync-logo.jpeg" alt="PragatiSync" />
-            </div>
-            <div className="login-intro-copy">
-              <span className="login-eyebrow">APPROVAL WORKFLOW · COMPLIANCE MONITORING</span>
-              <h1 id="login-product-name">A clearer view of every approval.</h1>
-              <p>
-                Review application progress, follow compliance actions, and keep
-                institutional records moving through their configured workflows.
+      <main className="demo-session-status" role={sessionError ? 'alert' : 'status'} aria-live="polite">
+        <div className="panel">
+          <img className="demo-session-logo" src="/pragatisync-logo.jpeg" alt="PragatiSync" />
+          {sessionConnecting ? (
+            <>
+              <strong>Connecting to the demo dashboard…</strong>
+              <div className="loading-indicator" aria-hidden="true" />
+            </>
+          ) : (
+            <>
+              <h1>Demo workspace unavailable</h1>
+              <p>{sessionError || 'Could not connect to the demo workspace.'}</p>
+              <p className="muted">
+                The backend must be configured for the isolated demo environment.
               </p>
-            </div>
-            <div className="login-intro-footer">
-              <span className="login-security-mark" aria-hidden="true">✓</span>
-              <span>Authorized access for your assigned role</span>
-            </div>
-          </section>
-
-          <section className="login-form-region" aria-labelledby="login-title">
-            <div className="login-card">
-              <span className="login-eyebrow">SECURE WORKSPACE</span>
-              <h2 id="login-title">Welcome back</h2>
-              <p className="muted">Sign in with your authorized account to continue.</p>
-
-              {loginError && <div className="notice login-error" role="alert">{loginError}</div>}
-
-              <form className="login-form" onSubmit={handleLogin}>
-                <label htmlFor="login-username">Username</label>
-                <input
-                  id="login-username"
-                  autoComplete="username"
-                  value={username}
-                  onChange={(event) => setUsername(event.target.value)}
-                  required
-                  disabled={loginBusy}
-                />
-
-                <label htmlFor="login-password">Password</label>
-                <div className="password-field">
-                  <input
-                    id="login-password"
-                    type={showPassword ? 'text' : 'password'}
-                    autoComplete="current-password"
-                    value={password}
-                    onChange={(event) => setPassword(event.target.value)}
-                    required
-                    disabled={loginBusy}
-                  />
-                  <button
-                    className="password-toggle"
-                    type="button"
-                    aria-label={showPassword ? 'Hide password' : 'Show password'}
-                    aria-pressed={showPassword}
-                    disabled={loginBusy}
-                    onClick={() => setShowPassword((visible) => !visible)}
-                  >
-                    {showPassword ? 'Hide' : 'Show'}
-                  </button>
-                </div>
-
-                <button className="primary-button login-submit" type="submit" disabled={loginBusy}>
-                  {loginBusy ? (
-                    <>
-                      <span className="button-spinner" aria-hidden="true" />
-                      Signing in...
-                    </>
-                  ) : 'Sign in'}
-                </button>
-              </form>
-              <p className="login-footnote">This demonstration system does not provide account recovery or registration.</p>
-            </div>
-            <p className="login-form-footer">AICTE Approval &amp; Compliance System <span>·</span> Prototype workspace</p>
-          </section>
-        </main>
-      </div>
+              <button
+                className="secondary-button"
+                type="button"
+                onClick={() => {
+                  setSessionError('')
+                  setSessionConnecting(true)
+                  setSessionRetry((attempt) => attempt + 1)
+                }}
+              >
+                Retry connection
+              </button>
+            </>
+          )}
+        </div>
+      </main>
     )
   }
 
@@ -1144,34 +966,19 @@ function App() {
             </button>
             <div className="breadcrumb"><span className="breadcrumb-root">AICTE WORKSPACE</span><span className="breadcrumb-separator">/</span>{page}</div>
           </div>
-          <div className={`user-chip ${DEMO_MODE ? 'demo-user-chip' : ''}`}>
-            {!DEMO_MODE && (
-              <>
-                <div className="avatar" aria-hidden="true">{(user.username || 'U').slice(0, 2).toUpperCase()}</div>
-                <div className="user-identity">
-                  <strong>{user.username}</strong>
-                  <span className="role-label">{role}</span>
-                </div>
-              </>
-            )}
-            {DEMO_MODE ? (
-              <label className="demo-role-control">
-                <span className="sr-only">Role</span>
-                <select
-                  aria-label="Role"
-                  value={role}
-                  disabled={roleSwitchBusy}
-                  onChange={(event) => handleDemoRoleChange(event.target.value)}
-                >
-                  <option>Admin</option>
-                  <option>Officer</option>
-                  <option>Viewer</option>
-                </select>
-              </label>
-            ) : (
-              <button className="secondary-button logout-button" onClick={handleLogout}>Log out</button>
-            )}
-          </div>
+          <label className="demo-role-control">
+            <span>Demo Role</span>
+            <select
+              aria-label="Demo Role"
+              value={role}
+              disabled={roleSwitchBusy}
+              onChange={(event) => handleRoleChange(event.target.value)}
+            >
+              {AVAILABLE_ROLES.map((availableRole) => (
+                <option key={availableRole} value={availableRole}>{availableRole}</option>
+              ))}
+            </select>
+          </label>
         </header>
 
         <section className="page-content">
@@ -2284,7 +2091,7 @@ function App() {
             )}
 
             <p className="prototype-note">
-              Demo authentication is enabled. Admin can configure workflows; Admin and Officer can process applications; Viewer is read-only.
+              The role selector is for this academic prototype, not production authorization. Admin can configure workflows; Admin and Officer can process applications; Viewer is read-only.
             </p>
           </section>
         </div>
