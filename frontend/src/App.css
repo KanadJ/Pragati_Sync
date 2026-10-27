@@ -1430,17 +1430,6 @@ h1 {
   padding: 14px 15px;
 }
 
-.dashboard-kpi-grid .stat-card:nth-child(5),
-.dashboard-kpi-grid .stat-card:nth-child(6) {
-  grid-column: auto;
-}
-
-@media (min-width: 1300px) {
-  .dashboard-kpi-grid {
-    grid-template-columns: repeat(6, minmax(0, 1fr));
-  }
-}
-
 .stat-top {
   color: #71817f;
   font-size: 10px;
@@ -1470,6 +1459,13 @@ h1 {
 
 .dashboard-kpi-grid .stat-note {
   min-height: 0;
+}
+
+@media (min-width: 1101px) {
+  .dashboard-kpi-grid .stat-card:nth-child(5),
+  .dashboard-kpi-grid .stat-card:nth-child(6) {
+    grid-column: span 2;
+  }
 }
 
 .dashboard-distribution-grid {

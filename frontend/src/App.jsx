@@ -1202,8 +1202,8 @@ function App() {
                 <Stat label="Total applications" value={dashboardData?.total_applications ?? '—'} note="All recorded applications" symbol="▤" />
                 <Stat label="Pending action" value={dashboardData?.pending_requests ?? '—'} note="Includes returned applications" symbol="◷" />
                 <Stat label="Overdue applications" value={dashboardData?.overdue_applications ?? '—'} note="Incomplete applications past deadline" symbol="!" />
-                <Stat label="Upcoming deadlines" value={dashboardData?.deadlines_soon ?? '—'} note="Due today through the next 7 days" symbol="⌁" />
                 <Stat label="Approved" value={dashboardData?.approved ?? '—'} note="Completed applications" symbol="✓" />
+                <Stat label="Upcoming deadlines" value={dashboardData?.deadlines_soon ?? '—'} note="Due today through the next 7 days" symbol="⌁" />
                 <Stat label="Returned" value={dashboardData ? dashboardData.by_status?.Returned || 0 : '—'} note="Counted within pending action" symbol="↶" />
               </div>
 
@@ -2376,7 +2376,7 @@ function ApplicationTable({ rows, selectedId, onSelect, loading = false }) {
   return (
     <div className="table-wrap" aria-busy={loading}>
       <table>
-        <thead><tr><th scope="col">APPLICATION / INSTITUTION</th><th scope="col">STAGE</th><th scope="col">OFFICER</th><th scope="col">STATUS</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
+        <thead><tr><th scope="col">APPLICATION / INSTITUTION</th><th scope="col">SUBMITTED</th><th scope="col">STAGE</th><th scope="col">OFFICER</th><th scope="col">STATUS</th><th scope="col"><span className="sr-only">Actions</span></th></tr></thead>
         <tbody>
           {rows.map((item) => (
             <tr key={item.id} className={selectedId === item.id ? 'selected-row' : ''}>
@@ -2384,6 +2384,7 @@ function ApplicationTable({ rows, selectedId, onSelect, loading = false }) {
                 <button type="button" className="application-link" onClick={() => onSelect(item.id)}>{item.id}</button>
                 <div className="institution-name">{item.institution}</div>
               </td>
+              <td>{item.date || '—'}</td>
               <td>{item.stage}</td>
               <td>{item.officer}<div className="institution-name">{item.region} Region</div></td>
               <td><Status status={item.status} /></td>
@@ -2391,7 +2392,7 @@ function ApplicationTable({ rows, selectedId, onSelect, loading = false }) {
             </tr>
           ))}
           {rows.length === 0 && (
-            <tr><td colSpan="5" className="empty-state" role="status">
+            <tr><td colSpan="6" className="empty-state" role="status">
               {loading ? 'Loading applications…' : 'No applications match your search.'}
             </td></tr>
           )}
