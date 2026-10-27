@@ -3,6 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import './App.css'
 
 const API = (import.meta.env.VITE_API_URL || 'http://localhost:8000').replace(/\/+$/, '')
+const DEMO_MODE = import.meta.env.VITE_PRAGATISYNC_DEMO_MODE === 'true'
 const TOKEN_KEY = 'aicte_demo_token'
 
 const FALLBACK_STAGES = [
@@ -34,14 +35,18 @@ function formatKolkataTimestamp(value, includeTime = true) {
 }
 
 function App() {
-  const [token, setToken] = useState(() => localStorage.getItem(TOKEN_KEY) || '')
+  const [token, setToken] = useState(() => (
+    DEMO_MODE ? '' : localStorage.getItem(TOKEN_KEY) || ''
+  ))
   const [user, setUser] = useState(null)
   const [authChecking, setAuthChecking] = useState(true)
+  const [demoSessionError, setDemoSessionError] = useState('')
   const [username, setUsername] = useState('')
   const [password, setPassword] = useState('')
   const [showPassword, setShowPassword] = useState(false)
   const [loginBusy, setLoginBusy] = useState(false)
   const [loginError, setLoginError] = useState('')
+  const [roleSwitchBusy, setRoleSwitchBusy] = useState(false)
 
   const [applications, setApplications] = useState([])
   const [dashboardData, setDashboardData] = useState(null)
@@ -134,8 +139,8 @@ function App() {
   }, [])
 
   const request = useCallback(async (path, options = {}) => {
-    const currentToken = token || localStorage.getItem(TOKEN_KEY)
-    const { responseType, ...requestOptions } = options
+    const { responseType, skipAuth = false, ...requestOptions } = options
+    const currentToken = skipAuth ? '' : token || localStorage.getItem(TOKEN_KEY)
 
     const response = await fetch(`${API}${path}`, {
       ...requestOptions,
@@ -152,7 +157,11 @@ function App() {
       ? await response.blob()
       : await response.json().catch(() => ({}))
 
-    if (response.status === 401 && path !== '/api/auth/login') {
+    if (
+      response.status === 401
+      && path !== '/api/auth/login'
+      && path !== '/api/auth/demo-session'
+    ) {
       localStorage.removeItem(TOKEN_KEY)
       setToken('')
       setUser(null)
@@ -255,7 +264,7 @@ function App() {
 
     setSelectedId((current) => {
       if (current && apps.some((item) => item.id === current)) return current
-      return apps[0]?.id || ''
+      return ''
     })
   }, [request, refreshHeatmap])
 
@@ -264,6 +273,52 @@ function App() {
     let active = true
 
     async function checkSession() {
+      if (DEMO_MODE) {
+        const savedToken = localStorage.getItem(TOKEN_KEY)
+        if (savedToken) {
+          try {
+            const data = await request('/api/auth/me')
+            if (!active) return
+            if (data.demo_mode === true) {
+              setToken(savedToken)
+              setUser(data)
+              setDemoSessionError('')
+              setAuthChecking(false)
+              return
+            }
+          } catch {
+            if (!active) return
+          }
+        }
+
+        localStorage.removeItem(TOKEN_KEY)
+        setToken('')
+        try {
+          const data = await request('/api/auth/demo-session', {
+            method: 'POST',
+            body: JSON.stringify({ role: 'Viewer' }),
+            skipAuth: true,
+          })
+          if (!active) return
+          if (!data.access_token || data.user?.role !== 'Viewer') {
+            throw new Error('The backend did not create a Viewer demo session.')
+          }
+          localStorage.setItem(TOKEN_KEY, data.access_token)
+          setToken(data.access_token)
+          setUser(data.user)
+          setDemoSessionError('')
+        } catch (error) {
+          if (!active) return
+          setDemoSessionError(error.message || 'Could not start the demo session.')
+        } finally {
+          if (active) {
+            setAuthChecking(false)
+            setLoading(false)
+          }
+        }
+        return
+      }
+
       const savedToken = localStorage.getItem(TOKEN_KEY)
 
       if (!savedToken) {
@@ -341,6 +396,28 @@ function App() {
     } finally {
       setLoginBusy(false)
       setAuthChecking(false)
+    }
+  }
+
+  async function handleDemoRoleChange(nextRole) {
+    setRoleSwitchBusy(true)
+    try {
+      const data = await request('/api/auth/demo-session', {
+        method: 'POST',
+        body: JSON.stringify({ role: nextRole }),
+      })
+      if (!data.access_token || data.user?.role !== nextRole) {
+        throw new Error('The backend did not confirm the requested demo role.')
+      }
+
+      localStorage.setItem(TOKEN_KEY, data.access_token)
+      setToken(data.access_token)
+      setUser(data.user)
+      clearNotice()
+    } catch (error) {
+      showNotice(`Could not switch demo role: ${error.message}`, 'error')
+    } finally {
+      setRoleSwitchBusy(false)
     }
   }
 
@@ -872,6 +949,17 @@ function App() {
         : ''
 
   if (authChecking) {
+    if (DEMO_MODE) {
+      return (
+        <main className="demo-session-status" role="status" aria-live="polite">
+          <div className="panel">
+            <img className="demo-session-logo" src="/pragatisync-logo.jpeg" alt="PragatiSync" />
+            <strong>Connecting to the configured demo workspace…</strong>
+          </div>
+        </main>
+      )
+    }
+
     return (
       <div className="login-shell">
         <main className="login-layout">
@@ -890,6 +978,21 @@ function App() {
   }
 
   if (!user || !token) {
+    if (DEMO_MODE) {
+      return (
+        <main className="demo-session-status" role="alert">
+          <div className="panel">
+            <img className="demo-session-logo" src="/pragatisync-logo.jpeg" alt="PragatiSync" />
+            <h1>Demo workspace unavailable</h1>
+            <p>{demoSessionError || 'A demo session could not be created.'}</p>
+            <p className="muted">
+              Enable the frontend demo flag and both backend demo environment settings, then refresh.
+            </p>
+          </div>
+        </main>
+      )
+    }
+
     return (
       <div className="login-shell">
         <main className="login-layout">
@@ -1041,13 +1144,29 @@ function App() {
             </button>
             <div className="breadcrumb"><span className="breadcrumb-root">AICTE WORKSPACE</span><span className="breadcrumb-separator">/</span>{page}</div>
           </div>
-          <div className="user-chip">
+          <div className={`user-chip ${DEMO_MODE ? 'demo-user-chip' : ''}`}>
             <div className="avatar" aria-hidden="true">{(user.username || 'U').slice(0, 2).toUpperCase()}</div>
             <div className="user-identity">
-              <strong>{user.username}</strong>
-              <span className="role-label">{role}</span>
+              <strong>{DEMO_MODE ? 'Demo session' : user.username}</strong>
+              {!DEMO_MODE && <span className="role-label">{role}</span>}
             </div>
-            <button className="secondary-button logout-button" onClick={handleLogout}>Log out</button>
+            {DEMO_MODE ? (
+              <label className="demo-role-control">
+                <span>Demo role</span>
+                <select
+                  aria-label="Demo role"
+                  value={role}
+                  disabled={roleSwitchBusy}
+                  onChange={(event) => handleDemoRoleChange(event.target.value)}
+                >
+                  <option>Admin</option>
+                  <option>Officer</option>
+                  <option>Viewer</option>
+                </select>
+              </label>
+            ) : (
+              <button className="secondary-button logout-button" onClick={handleLogout}>Log out</button>
+            )}
           </div>
         </header>
 

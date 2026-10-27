@@ -24,6 +24,8 @@ from fastapi.middleware.cors import CORSMiddleware
 DEFAULT_CORS_ORIGINS = (
     "http://localhost:5173",
     "http://127.0.0.1:5173",
+    "http://localhost:5174",
+    "http://127.0.0.1:5174",
     "https://aicte-approval-frontend.onrender.com",
 )
 
@@ -154,6 +156,21 @@ DEMO_USERS = {
         "salt": b"aicte-viewer-demo",
     },
 }
+
+DEMO_ROLES = {
+    "admin": "Admin",
+    "officer": "Officer",
+    "viewer": "Viewer",
+}
+
+
+def demo_mode_enabled():
+    return (
+        os.getenv("PRAGATISYNC_ENVIRONMENT", "").strip().lower() == "demo"
+        and os.getenv("PRAGATISYNC_DEMO_MODE_ENABLED", "").strip().lower()
+        == "true"
+    )
+
 
 # Prototype sessions are kept in memory and expire when the server restarts.
 SESSIONS = {}
@@ -413,6 +430,8 @@ def get_current_user(authorization: str | None = Header(default=None)):
             status_code=401,
             detail="Invalid or expired session. Please log in again.",
         )
+    if user.get("_demo_mode") and not demo_mode_enabled():
+        raise HTTPException(status_code=401, detail="Demo mode is disabled")
     return user
 
 
@@ -1626,9 +1645,49 @@ def login(payload: dict = Body(...)):
     return {"access_token": token, "token_type": "bearer", "user": user}
 
 
+@app.post("/api/auth/demo-session")
+def create_demo_session(
+    response: Response,
+    payload: dict = Body(...),
+    authorization: str | None = Header(default=None),
+):
+    if not demo_mode_enabled():
+        raise HTTPException(status_code=404, detail="Demo mode is disabled")
+
+    requested_role = payload.get("role")
+    if not isinstance(requested_role, str):
+        raise HTTPException(status_code=400, detail="A demo role is required")
+    role = DEMO_ROLES.get(requested_role.strip().lower())
+    if role is None:
+        raise HTTPException(status_code=400, detail="Unsupported demo role")
+
+    with SESSION_LOCK:
+        token = None
+        if authorization:
+            if not authorization.startswith("Bearer "):
+                raise HTTPException(status_code=401, detail="Invalid demo session")
+            previous_token = authorization.removeprefix("Bearer ").strip()
+            previous_user = SESSIONS.get(previous_token)
+            if not previous_user or not previous_user.get("_demo_mode"):
+                raise HTTPException(status_code=401, detail="Invalid demo session")
+            token = previous_token
+
+        if token is None:
+            token = secrets.token_urlsafe(32)
+        user = {"username": role.lower(), "role": role}
+        SESSIONS[token] = {**user, "_demo_mode": True}
+
+    response.headers["Cache-Control"] = "no-store"
+    return {"access_token": token, "token_type": "bearer", "user": user}
+
+
 @app.get("/api/auth/me")
 def auth_me(user=Depends(get_current_user)):
-    return user
+    return {
+        "username": user["username"],
+        "role": user["role"],
+        "demo_mode": bool(user.get("_demo_mode")),
+    }
 
 
 @app.post("/api/auth/logout")

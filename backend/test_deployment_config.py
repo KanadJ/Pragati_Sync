@@ -18,6 +18,8 @@ class DeploymentConfigurationTests(unittest.TestCase):
             [
                 "http://localhost:5173",
                 "http://127.0.0.1:5173",
+                "http://localhost:5174",
+                "http://127.0.0.1:5174",
                 "https://aicte-approval-frontend.onrender.com",
                 "https://aicte-demo.onrender.com",
                 "https://teammate.example",
@@ -39,15 +41,15 @@ class DeploymentConfigurationTests(unittest.TestCase):
         expected_path = Path(main.__file__).resolve().parent / "routing_rules.json"
         self.assertEqual(main.ROUTING_RULES_PATH, expected_path)
 
-    def test_render_login_preflight_allows_frontend_origin_and_credentials(self):
-        frontend_origin = "https://aicte-approval-frontend.onrender.com"
+    def test_demo_session_preflight_allows_vite_fallback_frontend_origin(self):
+        frontend_origin = "http://127.0.0.1:5174"
         database_directory = tempfile.TemporaryDirectory()
         original_database_path = main.DATABASE_PATH
         main.DATABASE_PATH = Path(database_directory.name) / "preflight-test.db"
         try:
             with TestClient(main.app) as client:
                 response = client.options(
-                    "/api/auth/login",
+                    "/api/auth/demo-session",
                     headers={
                         "Origin": frontend_origin,
                         "Access-Control-Request-Method": "POST",

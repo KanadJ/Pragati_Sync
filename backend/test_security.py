@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 from pathlib import Path
+from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
@@ -38,6 +39,133 @@ class RoleBasedAccessTests(unittest.TestCase):
         self.assertEqual(response.status_code, 200)
         token = response.json()["access_token"]
         return {"Authorization": f"Bearer {token}"}
+
+    def test_demo_session_requires_both_explicit_demo_environment_flags(self):
+        configurations = (
+            {},
+            {
+                "PRAGATISYNC_ENVIRONMENT": "production",
+                "PRAGATISYNC_DEMO_MODE_ENABLED": "true",
+            },
+            {
+                "PRAGATISYNC_ENVIRONMENT": "demo",
+                "PRAGATISYNC_DEMO_MODE_ENABLED": "false",
+            },
+        )
+        for configuration in configurations:
+            with self.subTest(configuration=configuration):
+                with patch.dict("os.environ", configuration, clear=True):
+                    response = self.client.post(
+                        "/api/auth/demo-session",
+                        json={"role": "Admin"},
+                    )
+                self.assertEqual(response.status_code, 404)
+
+    def test_demo_sessions_are_server_assigned_only_for_supported_roles(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "PRAGATISYNC_ENVIRONMENT": "demo",
+                "PRAGATISYNC_DEMO_MODE_ENABLED": "true",
+            },
+        ):
+            for role in ("Admin", "Officer", "Viewer"):
+                with self.subTest(role=role):
+                    response = self.client.post(
+                        "/api/auth/demo-session",
+                        json={"role": role},
+                    )
+                    self.assertEqual(response.status_code, 200)
+                    self.assertEqual(response.headers["cache-control"], "no-store")
+                    self.assertEqual(response.json()["user"]["role"], role)
+                    headers = {
+                        "Authorization": "Bearer " + response.json()["access_token"]
+                    }
+                    self.assertEqual(
+                        self.client.get("/api/applications", headers=headers).status_code,
+                        200,
+                    )
+
+            for role in ("Root", None):
+                with self.subTest(role=role):
+                    response = self.client.post(
+                        "/api/auth/demo-session",
+                        json={"role": role},
+                    )
+                    self.assertEqual(response.status_code, 400)
+
+            viewer = self.client.post(
+                "/api/auth/demo-session",
+                json={"role": "Viewer"},
+            ).json()
+            original_token = viewer["access_token"]
+            admin = self.client.post(
+                "/api/auth/demo-session",
+                headers={"Authorization": "Bearer " + original_token},
+                json={"role": "Admin"},
+            )
+            self.assertEqual(admin.status_code, 200)
+            self.assertEqual(admin.json()["access_token"], original_token)
+            self.assertEqual(admin.json()["user"]["role"], "Admin")
+            self.assertEqual(
+                self.client.post(
+                    "/api/applications",
+                    headers={"Authorization": "Bearer " + original_token},
+                    json={
+                        "id": "DEMO-ADMIN-ALLOWED",
+                        "institution": "Demo Institute",
+                        "region": "North",
+                        "officer": "Demo Officer",
+                        "date": "2026-10-27",
+                    },
+                ).status_code,
+                201,
+            )
+            viewer_response = self.client.post(
+                "/api/auth/demo-session",
+                headers={"Authorization": "Bearer " + original_token},
+                json={"role": "Viewer"},
+            )
+            self.assertEqual(viewer_response.status_code, 200)
+            self.assertEqual(viewer_response.json()["access_token"], original_token)
+            self.assertEqual(viewer_response.json()["user"]["role"], "Viewer")
+            self.assertEqual(
+                self.client.post(
+                    "/api/applications",
+                    headers={
+                        "Authorization": "Bearer " + viewer["access_token"]
+                    },
+                    json={
+                        "id": "DEMO-VIEWER-DENIED",
+                        "institution": "Demo Institute",
+                        "region": "North",
+                        "officer": "Demo Officer",
+                        "date": "2026-10-27",
+                    },
+                ).status_code,
+                403,
+            )
+
+    def test_demo_sessions_stop_authorizing_requests_when_demo_mode_is_disabled(self):
+        with patch.dict(
+            "os.environ",
+            {
+                "PRAGATISYNC_ENVIRONMENT": "demo",
+                "PRAGATISYNC_DEMO_MODE_ENABLED": "true",
+            },
+        ):
+            response = self.client.post(
+                "/api/auth/demo-session",
+                json={"role": "Admin"},
+            )
+        token = response.json()["access_token"]
+
+        with patch.dict("os.environ", {}, clear=True):
+            protected_response = self.client.get(
+                "/api/applications",
+                headers={"Authorization": "Bearer " + token},
+            )
+        self.assertEqual(protected_response.status_code, 401)
 
     def test_sensitive_reads_require_authentication(self):
         endpoints = [
